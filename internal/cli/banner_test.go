@@ -149,11 +149,11 @@ func TestRenderBannerContainsRequiredNotices(t *testing.T) {
 	}, buf.String())
 
 	// F-901 要求包含的关键声明。
-	// 注意 "R2端点" / "介质序列号白名单" / "没有入站监听" 三项对应 G-06′ 与 G-12：
-	// v3.0 起客户端具备一项受限出站，横幅必须如实披露，否则构成虚假陈述。
+	// 注意 "R2端点" / "采集策略" / "没有入站监听" 三项对应 G-06′ 与 G-12：
+	// 本项目起客户端具备一项受限出站，横幅必须如实披露，否则构成虚假陈述。
 	for _, must := range []string{
 		"安全警告", "免责声明", "CCBY-NC-SA", "私钥", "不删除",
-		"R2端点", "R2桶", "白名单", "没有入站监听",
+		"R2端点", "R2桶", "采集策略", "没有入站监听",
 	} {
 		if !strings.Contains(flat, must) {
 			t.Errorf("横幅缺少必要内容 %q", must)
