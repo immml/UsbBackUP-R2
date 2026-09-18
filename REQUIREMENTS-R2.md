@@ -66,7 +66,7 @@
 | F-F01 | 部署文件 `client.json`：R2 凭据 + 采集策略 + 上传策略；ACL 收紧为 `SYSTEM` + `Administrators` 可读 | P0 | 生成器下发 | 受保护文件 | 权限设置失败 → 拒绝继续并明确报错 | 不做「设置失败仍继续」的静默降级 |
 | F-F02 | **DPAPI 机器范围加密**（`crypt32.dll` 的 `CryptProtectData` / `CryptUnprotectData`，经 `syscall.NewLazyDLL` 调用） | P0 | 明文字段 | 密文落盘 | 解密失败（换机器/换账户）→ 明确报错 | 密文绑定本机，拷贝到别的机器解不开 |
 | F-F03 | 运行时仅内存解密；使用后 `zeroize` 清零（复用 `internal/keyfile` 的缓冲区清零约定） | P0 | 密文 | 内存凭据 | — | 不清屏、不写 swap 之外的中间文件 |
-| F-F04 | 最小权限：R2 API Token 侧仅授予目标 bucket + prefix 的 **Object Write**，不授予读权限、不授予 bucket 级权限 | P0 | 生成器引导 | 权限约束 | 探活发现权限过大 → WARN 提示收紧 | 权限过大 = 泄漏后损失面扩大 |
+| F-F04 | 最小权限：R2 API Token 用**桶级的 `Object Read & Write`**，并限定到目标桶；**不用** Admin 两档 | P0 | 生成器引导 | 权限约束 | 探活发现账户级权限 → WARN 提示收紧（`ListBuckets` 成功即越权） | 见下方 §3.1：R2 没有「只写不读」档位，也不能把长效 token 限定到 key 前缀 |
 | F-F05 | 可轮换：替换 `client.json` 即完成换 token，**不需重新编译客户端** | P0 | 新凭据 | 生效 | — | 泄漏时的处置动作是「吊销 + 换文件」 |
 | F-F06 | 启动自检：凭据缺失 / DPAPI 解密失败 / 字段不全 → **明确报错并禁用上传能力**，退回「仅本地产物」模式，不静默降级 | P0 | 启动流程 | 能力开关 | — | 降级必须显式且可见 |
 | F-F07 | 凭据永不出现在日志、审计、命令行参数、进程命令行中（避免 `wmic process` 看到） | P0 | — | — | 检测到日志含凭据 → 视为缺陷 | 传参一律走文件读取 |
@@ -139,7 +139,7 @@
 |---|---|---|
 | 存储位置 | 编译进 exe 的数据段 | 独立的 `client.json`，DPAPI 机器范围加密 |
 | 被提取后果 | 任何拿到 exe 的人都能提取，持有桶的读写权限 | 密文绑定本机账户，拷走文件无法解开 |
-| 权限范围 | 通常沿用完整 token 权限 | 仅目标 bucket + prefix 的 Object Write，无读权限（F-F04） |
+| 权限范围 | 通常沿用完整 token 权限 | 桶级 `Object Read & Write` + 仅限目标桶；不用 Admin 档（F-F04） |
 | 泄漏处置 | 必须重新编译并重新分发所有客户端 | 替换 `client.json` 或吊销 token，**不需重编译**（F-F05） |
 | 混淆的作用 | 被当作保护手段，但只提高逆向成本，不改变"可提取"这一事实 | 不引入 garble：它破坏 N-104「零依赖 + 可离线构建」，且保护不了 exe 之外的凭据文件 |
 | 残余风险 | 高且不可控 | 有界：本机管理员/SYSTEM 可读；已在此前提下设计权限最小化与轮换 |
@@ -147,6 +147,31 @@
 **必须向用户明示**（写入 README / DISCLAIMER / 生成器提示 F-910）：任何落在目标机器上的凭据都存在被提取的可能，尤其是具备本机管理员权限的主体。因此本项目的防护目标是**把损失面压到最小并让轮换成本接近零**，而不是声称"不可提取"。
 
 ---
+
+### 3.1 R2 权限档位的现实约束（对 F-F04 的修正）
+
+早期需求写的是「仅授予目标 bucket + prefix 的 Object Write，不授予读权限」。**按 R2 当前的能力，这条要求无法直接达成**，必须改写：
+
+| 事实 | 依据 |
+|---|---|
+| 控制台可签发的长效 API token 只有四档：`Admin Read & Write` / `Admin Read only` / `Object Read & Write` / `Object Read only`。**没有"只写不读"这一档** | R2 文档 *Authentication → Permissions* |
+| 可限定的维度是**桶**（Apply to specific buckets only），**不是 key 前缀** | 同上 |
+| 只有 `Admin` 两档能列举账户下的桶；`Object` 两档调 `ListBuckets` 会被 403 拒掉 | 权限组的资源类型：Account vs Bucket |
+| 真正能限定到前缀的是 **Temporary Access Credentials**（`POST /accounts/{id}/r2/temp-access-credentials`，支持 `prefixes` / `objects`），但 **TTL 上限 604800 秒（7 天）** | R2 API Reference |
+
+**据此确定的落地形态**：
+
+1. 用**桶级 `Object Read & Write` + 仅限目标桶**——这是可达的最小权限。绝不使用 `Admin` 两档。
+2. 因为这一档同时能读、能覆盖、能删除，必须配套两条：
+   - **桶开启版本控制（Object Versioning）**：让"覆盖"或"误删"不销毁历史版本，攻击者拿到凭据也删不掉你的备份；
+   - **定期轮换 token**：换一份 `client.json` 即可，不必重编客户端（F-F05）。
+3. `r2-check` 用 `ListBuckets` 做**权限过大检测**：成功 = 账户级权限，报 WARN；403 = 期望结果，报 OK。这是 F-F04「探活发现权限过大 → WARN」唯一可实施的判据。
+4. 想要"只写 + 限定前缀"的长效形态，只能引入中间层（Cloudflare Worker 持真凭据，客户端只持受限 token）。**不在本项目范围内**，作为后续演进记录在此。
+
+**残余风险（须写入 README）**：上传凭据泄漏后，持有者不仅能上传伪造对象，还能读取已有密文、覆盖或删除对象。前者由端到端加密兜住（密文无密钥不可读），后者由版本控制兜住。**因此版本控制不是可选项，是配套前提。**
+
+---
+
 
 ## 4. 异常处理与重试
 
@@ -160,7 +185,7 @@
 | `uploadID` 失效 | 放弃续传，从头开始 | INFO |
 | 上传后大小不一致 | 重传一次；仍不一致则标记失败并保留本地 | ERROR |
 | 介质中途拔出 | 中止作业，清理半成品，不损伤源盘 | WARN |
-| `collect_policy=off` | 采集分支整体关闭（F-G01） | INFO + 说明只走回写分支 |
+| `collect_policy=off` | 采集分支整体关闭（F-G01） | INFO + 说明只剩手工 `upload` 一条路 |
 | 磁盘空间不足 | 中止 + 清理半成品 | ERROR |
 
 ---

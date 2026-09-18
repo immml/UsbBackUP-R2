@@ -1,9 +1,13 @@
 # usbbackup-r2
 
-**Windows 专用 USB 自动备份与加密上传工具** —— 无 UI、无 HID 依赖、纯 Go 标准库实现。
+Windows 专用的 **U 盘自动采集 → 整盘打包 → 混合加密 → 自动上传对象存储** 工具。三件套：**客户端**（在目标机器上跑）、**生成器**（在你手里）、**解密器**（在你手里）。
 
-> ⚠️ **使用前必读**：本工具会对接入本机的可移动存储介质执行**自动**读写操作，
-> 并把加密产物**上传到你配置的 Cloudflare R2 桶**。
+- **零第三方依赖**：只用 Go 标准库，R2 的 SigV4 签名是手写的（不引 AWS SDK），可离线构建。
+- **纯 Windows**：只针对 Windows amd64，用 Win32 API。
+- **源介质只读**：全程不写入、不删除、不改名被采集盘上的任何文件。
+
+> ⚠️ **使用前必读**：本工具会对接入本机的可移动介质执行**自动**读取与打包，
+> 并把加密产物**上传到你在配置里指定的 Cloudflare R2 桶**。
 > 请先完整阅读 [DISCLAIMER.md](DISCLAIMER.md) 与本文档的「安全提示」一节。
 > **仅限用于你自己拥有或完全管理的机器，以及你自己拥有的可移动介质。**
 >
@@ -13,400 +17,478 @@
 
 ## 0. 这是一个独立项目
 
-本项目是独立的 `usbbackup-r2`，**不是** [UsbBackUP](https://github.com/immml/UsbBackUP) 的分支、
-不是它的版本升级、也不共用任何运行时资产。两者唯一的共同点是容器格式。
+本仓库是 [UsbBackUP](https://github.com/immml/UsbBackUP)（不含任何出站能力的那一版）的**独立分支**，不是它的补丁，也不共享 module。两者刻意保持一致的东西：
 
-| | UsbBackUP（另一个项目） | 本项目 usbbackup-r2 |
+| 共用 | 值 |
+|---|---|
+| 容器格式 | 魔数 `USBK`、`Version=1`、`OAEPLabel="usbbackup/v1"`、96 字节固定头 |
+| 授权标记 | `.usbbackup-allow`（两边同名，工具盘互相认） |
+| 命令行约定 | 全局开关 `--config` / `--yes`、退出码语义、`I AGREE` 首启确认 |
+
+刻意分开的东西：
+
+| | `UsbBackUP` | 本仓库 |
 |---|---|---|
-| 网络 | **零网络**，可用 `strings` 复核 | **唯一出站**：HTTPS 上传到你配置的 R2 端点 |
-| 产物去向 | 只留本机 `%TEMP%\backup\` | 加密容器上传到 R2 桶 |
-| 程序集名 | `usbbackup` | `usbbackup-r2` |
-| 服务名 | `usbbackup` | `usbbackup-r2` |
+| 出站网络 | **零网络** | 仅到配置的 R2 endpoint 的 HTTPS |
+| 私钥回写分支 | 有 | **已移除** |
+| 产物去向 | 只留本机 `%TEMP%\backup` | 上传到 R2（也可只留本地） |
+| 解密方式 | 手工把 `.usbk` 拷回来 | 解密器直接从 R2 拉取并解密 |
+| 程序集名 / 服务名 | `usbbackup` | `usbbackup-r2` |
 | 配置目录 | `%LOCALAPPDATA%\usbbackup\` | `%LOCALAPPDATA%\usbbackup-r2\` |
 | 环境变量前缀 | `USBBACKUP_*` | `USBBACKUP_R2_*` |
-| 授权标记 | `.usbbackup-allow` | `.usbbackup-r2-allow` |
 | 密钥默认名 | `usbbackup.key.pem` / `.pub.pem` | `usbbackup-r2.key.pem` / `.pub.pem` |
-| 五个可执行文件 | `usbbackup` / `usbkeygen` / `usbsetup` / `usbcomp` / `usbunseal` | 各自加 `-r2` 后缀 |
+| 可执行文件 | `usbbackup` / `usbkeygen` / `usbsetup` / `usbcomp` / `usbunseal` | 各自加 `-r2` 后缀 |
 
-因此**两者可以装在同一台机器上**：服务名、配置目录、环境变量、授权标记、密钥文件名
-全部独立，谁都不会覆盖谁，谁也不会误认对方的介质。
+所以**两者可以装在同一台机器上**：服务名、配置目录、环境变量、密钥文件名全部独立，谁都不会覆盖谁。**唯一故意同名的是授权标记**——两个项目的工具盘都要被对方认出来是"自己人的盘"，名字不同反而会互相采集。
 
-**唯一刻意保持一致的是容器格式**：魔数 `USBK`、版本 1、OAEP label `usbbackup/v1` 都没动。
-两个项目产出的 `.usbk` 因此互相可解（本项目的 `usbunseal-r2` 能解 UsbBackUP 的容器，反之亦然）。
-label 是**格式标识**而非产品标识，改它等于凭空造出一个不兼容格式，还得同步递增容器版本号——
-没有收益，所以不改。
+**容器格式保持一致**：label 是**格式标识**而非产品标识，改它等于凭空造出一个不兼容格式，还得同步递增容器版本号——没有收益，所以不改。两个项目产出的 `.usbk` 互相可解。
 
 > 别把两套工具混装进同一个目录。名字只差一个后缀，行为却不同，拿错很自然。
-
 
 ---
 
 ## 1. 它做什么
 
-### 三个角色（典型部署形态）
-
-| 角色 | 程序 | 运行位置 | 持有内容 |
-|---|---|---|---|
-| **生成器** | `usbkeygen-r2` | 你的机器 | 生成密钥对；**私钥始终留在你这里** |
-| **生成向导** | `usbsetup-r2` | 你的机器 | 交互式一步步问，产出同一个客户端（不用记参数） |
-| **客户端** | 生成器产出的 `client.exe` | 目标机器 | 只有**公钥与配置**，硬编码进 exe |
-| **解压器** | `usbunseal-r2` | 你的机器 | 用**私钥**解密并还原 |
+### 三个角色
 
 ```
-生成器 ──产出──► 客户端（内嵌配置+公钥）──在目标机器上──► 打包加密 .usbk
-   │                                                          │
-   └──私钥留在本地──────► 解压器 ◄──────取回 .usbk──────────────┘
+       你（生成器）                          目标机器（客户端）              你（解密器）
+ ┌───────────────────────┐          ┌──────────────────────────┐   ┌──────────────────────┐
+ │ usbkeygen-r2          │          │ client.exe               │   │ usbunseal-r2         │
+ │  · generate  生成密钥 │  ──部署──▶│  · 内嵌配置 + 公钥       │   │  · remote  列远端    │
+ │  · cred      生成凭据 │          │  · 插盘后自动采集        │   │  · pull   下载+解密  │
+ │  · build-client 产客户端│        │  · 打包 → 加密 → 上传    │   │     用本机私钥       │
+ │  · install-usb 装工具盘│          │  · 只持有**公钥**        │   │  · 需要**私钥**      │
+ └───────────────────────┘          └──────────────────────────┘   └──────────────────────┘
+            私钥从不离开你                                                 ↑
+                                   ┌──────────────┐                      │
+                                   │  Cloudflare  │──────────────────────┘
+                                   │  R2 桶       │  下载密文（.usbk）
+                                   └──────────────┘
 ```
 
-客户端**没有私钥**：即使整个 exe 被人拷走，也解不开它自己产出的文件。
-这不是靠隐藏，而是混合加密里"公钥可公开、私钥不离开你"的直接结果。
+**私钥永远只在"你的机器"上**：客户端只内嵌公钥，它能加密、不能解密。所以客户端（连同它内嵌的公钥）落在别人手里也不会泄露任何历史备份。
 
-### 插入后做什么
-
-插入 U 盘后，`usbbackup-r2`（或客户端）自动判断该介质属于哪一类，并执行对应动作：
+### 插入 U 盘后做什么
 
 ```
-                    ┌───────────────────────────────┐
-   USB 插入事件 ───► │ winvol：卷类型 / 就绪等待       │
-                    └───────────────┬───────────────┘
-                                    ▼
-                    ┌───────────────────────────────┐
-                    │ collectpolicy：采集策略判定      │  ← 见 collect_policy
-                    └───────────────┬───────────────┘
-                          未命中     │           │ 放行
-                                    ▼           ▼
-                        ┌────────────────┐  ┌──────────────────────────┐
-                        │ 跳过：零读取    │  │ keyfile：私钥存在性检测    │
-                        │ 只记审计告警    │  │ （只判定"有没有"）          │
-                        └────────────────┘  └───────┬──────────┬───────┘
-                                          检测到私钥 │          │ 未检测到
-                                          （已授权） │          │
-                                                    ▼          ▼
-                        ┌───────────────────────────┐  ┌──────────────────────────────┐
-                        │ 分支 A：本地备份回写        │  │ winvol：容量门控              │
-                        │ 本地「备份文件夹」          │  │ 已占用容量 > 阈值(默认10GiB)? │
-                        │   → <U盘>:\backup\         │  └────┬───────────────────┬─────┘
-                        │ 不删源盘任何文件            │   超过 │                   │ 未超过
-                        └───────────────────────────┘        ▼                   ▼
-                                                     ┌──────────────┐  ┌─────────────────────────┐
-                                                     │   直接跳过    │  │ 分支 B：整盘打包 + 加密   │
-                                                     └──────────────┘  │ zip → AES-256-GCM       │
-                                                                       │ → RSA-OAEP 包装会话密钥   │
-                                                                       │ 源盘全程只读              │
-                                                                       └────────────┬────────────┘
-                                                                                    ▼
-                                                                       ┌─────────────────────────┐
-                                                                       │ r2：上传加密容器到你的桶  │
-                                                                       │ 唯一出站，仅 HTTPS        │
-                                                                       └────────────┬────────────┘
-                                                                                    ▼
-                                                                       ┌─────────────────────────┐
-                                                                       │ 按配置清理 / 保留本地副本 │
-                                                                       └─────────────────────────┘
+卷到达事件
+  │
+  ├─ 卷就绪等待（刚插入时卷可能还没挂载完）
+  │
+  ├─ 卷类型检查 ── 非可移动卷 → 跳过（除非显式 --allow-fixed，仅供排障）
+  │
+  ├─ 盘根有 .usbbackup-allow ？ ── 有 → **豁免**，直接结束
+  │                                    （不读、不打包、不上传；任何策略档位都不能绕过）
+  │
+  ├─ 采集策略判定
+  │    all          → 放行
+  │    marker_only  → 只有盘根带 .usbbackup-collect 才放行
+  │    off          → 跳过
+  │
+  ├─ 容量门控 ── 已占用 > 阈值 → 跳过
+  │
+  └─ 整盘 zip 流式直送混合加密（明文 zip 不落盘）
+       │
+       ├─ 上传到 R2（可选）→ HEAD 核对远端大小 → 按配置删/留本地密文
+       │
+       └─ 审计记录（一行 JSON）
 ```
 
-**两个分支都不会删除、移动、改名或改写源介质上的任何文件。**
+**全程对源介质只读**。唯一的写动作落在本机产物目录与远端对象存储上。
 
 ### 关键行为约定
 
-| 项 | 行为 |
-|---|---|
-| 采集策略 | `collect_policy` 三档：`all`（默认，未带私钥的介质一律采集，受容量上限约束）/ `marker_only`（仅盘根带 `.usbbackup-r2-allow` 的介质进采集分支，未命中则**零读取**、只记审计）/ `off`（关闭采集分支）。**卷序列号只用于审计对账，不作准入依据** —— 它在格式化后会变（D-20） |
-| 私钥检测 | **只做存在性判定**：比对文件名模式 + 文件开头 4 KiB 的内容特征。不读取、不解析、不复制、不缓存、不写日志、不外传任何私钥内容 |
-| 授权分支写入位置 | 仅 `<U盘>:\backup\`。不覆盖该目录外的任何对象；同名文件默认跳过 |
-| 非授权分支 | 只读源盘；产物为单一加密容器 `{卷标}.zip.usbk` |
-| 明文 zip | **默认不落盘**（流式直送加密器）。如需保留，显式加 `--keep-plain-zip` |
-| 网络 | **唯一出站**：向配置的 R2 端点主机上传加密容器，仅 HTTPS 且强制校验证书。目标主机在代码层校验，配置改指向别处会被拒绝。**无入站监听、无远程指令、无遥测、无控制通道** |
-| 上传失败 | 指数退避重试（默认 5 次，4xx 不重试）；网络不通则保留产物与续传状态，**不阻塞后续介质处理** |
-| 凭据 | R2 凭据放在本机 **DPAPI 加密**的 `client.json`，不编译进 exe；应授予「仅目标桶/前缀的对象写入」并定期轮换 |
-| 隐蔽性 | 无加壳、无免杀、无隐藏进程/窗口/端口、不写自启动、不修改注册表 |
+- 明文 zip **不落盘**：打包与加密用管道直接串起来，中间只有密文落盘（决策 D-03）。
+- 上传失败**不把整次作业判成失败**：本地已经有一份完好的密文，判失败会让人以为数据丢了。处置是保留本地 + 记审计 + 用 `upload` 子命令补传。
+- 凭据不可用时**明确报错并退回"仅本地产物"模式**，不静默降级。
+- 审计记录**只有盘符、卷标、容量、分支、布尔判定与计数**，没有文件名、没有清单、没有内容、没有 token。
+- 远端对象键带 UTC 时间戳（`usb/20260918T143739Z_<卷标>.zip.usbk`）：同一块盘的多次采集互不覆盖。远端没有本地的冲突改名逻辑，重名就是静默覆盖上一次的备份。
 
 ---
 
 ## 2. 加密方案
 
-采用标准**混合加密**：非对称算法只用于包装对称密钥，数据本身由对称算法加密。
+单一容器文件 `.usbk`：
 
-```
-                    随机会话密钥（32 字节，仅存在于内存）
-                              │
-        RSA-OAEP(SHA-256)      │  ← 非对称算法只用在这里
-                              ▼
-                     512 字节"包装密钥" ──► 写入容器头
-                              
-   明文流 ──► AES-256-GCM 分块(默认 1 MiB) ──► 密文帧 ──► .usbk 容器
-```
-
-| 组成 | 算法 / 参数 |
-|---|---|
-| 密钥包装 | RSA + OAEP(SHA-256)，label `usbbackup/v1`（协议常量，与仓库路径无关）；默认 4096 位、下限 2048 位 |
-| 数据加密 | AES-256-GCM，默认分块 1 MiB |
-| 分块 Nonce | 8 字节随机前缀 ‖ 4 字节块序号（大端），保证同密钥下绝不重复 |
-| 分块 AAD | 容器头哈希 ‖ 块序号 ‖ 帧标志 → 防块重排、跨文件拼接、头部篡改 |
-| 完整性 | 每块独立认证；末块元数据帧携带明文 SHA-256 与明文长度，缺块即判定截断 |
-| 内存占用 | O(块大小)，约数 MiB 峰值，不整份载入 |
-| 私钥口令保护 | PBKDF2-HMAC-SHA256（60 万次）+ AES-256-GCM（可选） |
-
-容器格式（`.usbk`，头部为明文，不含任何密钥材料）：
-
-| 偏移 | 长度 | 字段 |
+| 层级 | 算法 | 说明 |
 |---|---|---|
-| 0 | 4 | 魔数 `USBK` |
-| 4 | 2 | 版本 |
-| 6 | 2 | 密钥包装算法编号 |
-| 8 | 2 | 数据加密算法编号 |
-| 10 | 4 | 分块大小 |
-| 14 | 8 | 明文长度（0 = 见末块元数据） |
-| 22 | 8 | Nonce 随机前缀 |
-| 30 | 32 | 明文 SHA-256 |
-| 62 | 32 | 公钥指纹（SHA-256） |
-| 94 | 2 | 包装密钥长度 |
-| 96 | n | 包装密钥 |
+| 会话密钥包装 | RSA-OAEP（SHA-256） | 用公钥包装一把随机的 AES-256 密钥 |
+| 数据加密 | AES-256-GCM | 分块，每块独立 nonce；篡改与截断都会导致解密失败 |
+| 密钥长度 | 默认 4096 位（下限 2048，上限 8192） | |
 
-之后是密文帧序列：`[1B 标志][4B 密文长度][密文 + 16B Tag]`，最后一帧为元数据帧。
+容器头 96 字节里含公钥指纹，所以**不需要私钥就能确认这份密文是给哪把密钥的**。指纹只标识密钥身份，不泄露任何密钥材料。
+
+解密失败时不区分"密钥不对"与"数据被篡改"——避免把校验信息变成攻击者的反馈渠道。
 
 ---
 
-## 3. 安装
+## 3. 安装与构建
 
-### 3.1 直接使用预编译产物
+### 3.1 预编译产物
 
-把 `dist\` 下的 5 个 exe 放到任意目录（建议 `C:\Program Files\usbbackup-r2\`），然后：
+`dist/` 下有五个 exe，全部是 `windows/amd64`（`usbbackup-r2.exe` 用 `-H windowsgui`，常驻时不弹控制台窗口）：
 
-```powershell
-# 生成密钥对（首次使用）
-.\usbkeygen-r2.exe generate --out C:\ProgramData\usbbackup-r2\keys
+| 程序 | 作用 |
+|---|---|
+| `usbbackup-r2.exe` | 主程序 / 客户端（常驻监控） |
+| `usbkeygen-r2.exe` | 生成器（密钥、凭据、客户端、工具盘） |
+| `usbsetup-r2.exe` | 交互式向导（不想记参数就用它） |
+| `usbunseal-r2.exe` | 解密器（含从 R2 拉取） |
+| `usbcomp-r2.exe` | 压缩器（手工打包任意目录） |
+| `client.exe` | 生成器产出的客户端（内嵌配置与公钥），**不是构建产物** |
 
-# 登记公钥（配置只保存公钥，不保存私钥）
-.\usbkeygen-r2.exe use C:\ProgramData\usbbackup-r2\keys\usbbackup-r2.pub.pem
-
-# 校验配置与环境
-.\usbbackup-r2.exe config-check
-
-# 只读诊断：看看某个盘符会被怎么处理（不写任何数据）
-.\usbbackup-r2.exe probe --drive E:
-```
+另有交叉编译产物 `dist/usbunseal-r2-linux-amd64` / `-arm64`（ELF，原生可执行，见 [4.3.1](#431-在-linux-上取回备份)）。
 
 ### 3.2 从源码构建
 
-需要 **Go 1.24 或更高版本**（开发环境实测 Go 1.27.1）。零第三方依赖，可离线构建。
+需要 Go 1.24+，无第三方依赖，可离线构建。
 
-```powershell
-cd D:\path\to\usbbackup-r2
-.\build.ps1 -Version 0.1.0 -Test
+```PowerShell
+# Windows / PowerShell
+cd D:\Users\flowe\WorkBuddy\渗透\usbguard-r2
+.\build.ps1                 # 全部编到 .\dist\
+.\build.ps1 -Clean          # 先清掉 dist\
 ```
-
-或在任何 shell 中手工构建：
 
 ```bash
-# Linux (含 WSL / Git Bash) 交叉编译 Windows 产物
-cd /d/Users/flowe/WorkBuddy/渗透/usbbackup-r2
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
-  go build -trimpath -o dist/ \
-    github.com/immml/UsbBackUP-R2/cmd/usbbackup-r2 \
-    github.com/immml/UsbBackUP-R2/cmd/usbkeygen-r2 \
-    github.com/immml/UsbBackUP-R2/cmd/usbsetup-r2 \
-    github.com/immml/UsbBackUP-R2/cmd/usbcomp-r2 \
-    github.com/immml/UsbBackUP-R2/cmd/usbunseal-r2
+# Linux（含 WSL / Git Bash）：交叉编译 Windows 五件套 + Linux 解密器
+cd /d/Users/flowe/WorkBuddy/渗透/usbguard-r2
+./build.sh                  # 只出 Windows 五件套
+./build.sh linux            # 额外出 linux/amd64 + linux/arm64 的 usbunseal-r2（并校验 ELF 魔数）
+./build.sh -t               # 先跑 gofmt + go vet + go test
 ```
-
-> **`-o` 必须写相对路径。** `go.exe` 是原生 Windows 程序，不认 MSYS 的 `/d/...`：
-> 把它当成 `D:\d\...`，5 个 exe 会静默落到 `D:\d\Users\...` 下且**不报错**。
-> `build.sh` 已按此处理（先 `cd` 到仓库根，再输出到相对路径 `dist/`）。
-
-目标平台：Windows 10 1809+ / Windows 11 / Windows Server 2019+，**amd64**。
 
 ---
 
 ## 4. 使用
 
-### 4.1 生成器 `usbkeygen-r2`
+### 4.1 完整流程（推荐路径）
 
-启动时会**强制展示安全警告与免责声明**，并要求输入 `I AGREE` 才能继续。
+#### 第一步：生成密钥对（在你的机器上）
 
-| 子命令 | 说明 |
-|---|---|
-| `generate` | 生成 RSA 密钥对。`--bits`（默认 4096，下限 2048）、`--out`、`--private`、`--public`、`--force`、`--pass`（交互式口令）、`--pass-file` |
-| `use <公钥>` | 选择已有公钥并登记到配置。传入私钥会被明确拒绝 |
-| `inspect <公钥>` | 查看公钥位数与 SHA-256 指纹（分组十六进制） |
-| `selftest` | 就地验证混合加密往返、篡改检测、截断检测、错误密钥拒绝。全程内存操作，不落盘 |
-| **`build-client`** | **产出内嵌配置与公钥的客户端 exe**（见下节） |
-| **`install-usb`** | **组装一个便携工具 U 盘**：全套工具 + 客户端 + 密钥 + 授权标记 |
-| `version` | 版本信息 |
-
-自动化场景可加 `--yes` 跳过 `I AGREE` 交互。
-
-### 4.1.1b 交互式生成向导 `usbsetup-r2`
-
-```powershell
-.\usbsetup-r2.exe
+```PowerShell
+# PowerShell
+cd D:\backup
+..\dist\usbkeygen-r2.exe generate --out .\keys --pass
 ```
 
-双击进黑窗口，一问一答五步走完（密钥 → 产物目录 → 阈值 → 打包上限 → 输出），
-每步直接回车用默认值。与 `usbkeygen-r2 build-client` 共用同一份生成逻辑
-（`internal/clientgen`），产物行为完全一致。
+`--pass` 会交互式要一个口令来保护私钥（无回显）。生成后 **立刻离线备份私钥与口令**——私钥丢了，密文就永远解不开了。
 
-### 4.1.2 首次确认与静默运行
+#### 第二步：生成 R2 凭据（在你的机器上）
 
-被部署端（客户端，或 `usbbackup-r2` 本体）**首次用一条命令确认，之后无人值守静默运行**：
+先到 Cloudflare 控制台建一个 API token（权限要求见 §5.1），然后：
 
-| 命令 | 作用 |
-|---|---|
-| `accept` | 展示完整安全警告与免责声明，要求输入 `I AGREE` |
-| `accept --yes` | 部署脚本用：非交互记录确认 |
-| `accept --check` | 查看当前是否已确认（未确认退出码 2） |
-| `accept --revoke` | 撤销确认，恢复首次确认流程 |
-| `accept --force` | 已确认时重新确认 |
-
-确认后写入明文记录 `%LOCALAPPDATA%\usbbackup-r2\agreement.json`
-（含确认时间、程序版本、许可协议、客户端标识），此后 `run` / `once`
-**不再展示横幅、不再要求输入**，直接执行。
-
-```
-未确认 ──► run/once 展示免责声明并要求 I AGREE ──► 拒绝则退出码 2
-                    │ 输入 I AGREE
-                    ▼
-              写入 agreement.json ──► 之后 run/once 静默运行
+```PowerShell
+# PowerShell
+cd D:\backup
+..\dist\usbkeygen-r2.exe cred `
+  --out .\client.json `
+  --account-id aacbb6abba999cde14c3ddcce80ec425 `
+  --bucket usbbackup `
+  --prefix usb/ `
+  --access-key-id <Access Key ID> `
+  --label "office-pc 的上传凭据"
+# Secret Access Key 会交互式询问（无回显）；不要写在命令行上
 ```
 
-要点：
+生成完立刻验一下：
 
-- 记录**只能**由 `accept` 显式写入。命令行 `--yes` 只跳过**当次**确认，不留下记录——
-  避免"跑一次脚本就永久静默"。
-- 记录明文、可查看、可撤销；伪造或缺少确认短语的文件一律按"未确认"处理。
-- 静默只是不再打扰：**不自启动、不加壳、不隐藏进程**，日志与审计照常写入。
-- 服务由 SCM 启动、没有控制台，不做交互；`install-service` 会提示本机是否已确认。
+```PowerShell
+# PowerShell
+..\dist\usbkeygen-r2.exe r2-check --cred-file .\client.json
+```
 
-典型部署序列：`accept --yes` → `install-service`（可选，需管理员）→ `start`。
+`r2-check` 依次检查：写入对象 → 读回元数据 → 清理探活对象 → **权限范围**（用 `ListBuckets` 判断 token 是不是账户级 Admin，是就报 WARN）。
 
-### 4.1.1 产出客户端（推荐部署方式）
+> **默认的凭据是 DPAPI 机器范围加密的**：在这一台电脑上生成的，拿到别的电脑上解不开。这是设计意图，不是故障。**部署到哪台机器，就在哪台机器上生成一份 `client.json`。**
+>
+> 例外是"要拿到 Linux 上用"：Linux 没有 DPAPI，读不了这种凭据。给 Linux 的那一份必须加 `--cred-pass-file`（口令加密）或 `--plain-file`（明文，最后手段）。**同一条 R2 token 可以生成多份凭据，保护方式各选各的**——客户端那份用 DPAPI，解密器那份用口令，互不影响。
 
-```powershell
-# 1) 生成密钥对（私钥留在本地，绝不随客户端分发）
-.\usbkeygen-r2.exe generate --out .\keys
+#### 第三步：产出客户端
 
-# 2) 产出客户端：配置与公钥硬编码进 exe
-.\usbkeygen-r2.exe build-client `
+```PowerShell
+# PowerShell
+cd D:\backup
+..\dist\usbkeygen-r2.exe build-client `
   --public .\keys\usbbackup-r2.pub.pem `
-  --template .\usbbackup-r2.exe `
-  --output-dir '%TEMP%\backup' `
+  -o .\client.exe `
+  --template ..\dist\usbbackup-r2.exe `
+  --output-dir "%TEMP%\backup" `
   --threshold 10GiB `
-  --name 'Client-A' `
-  -o .\client.exe
+  --name "office-pc" `
+  --collect all `
+  --upload `
+  --cred-name client.json
 ```
 
-产出的 `client.exe` 拿到目标机器上**直接运行即可**，不需要 config.json、不需要公钥文件：
+产出的是**单个 exe**：配置与公钥内嵌在 PE 文件尾部的 overlay 块里（带 SHA-256 校验），不需要再分发配置文件。`--no-upload` 可以显式关掉上传（只落本地）。
 
-```powershell
-.\client.exe run          # 常驻监控（事件驱动）
-.\client.exe once         # 处理当前已插入的盘后退出
-.\client.exe probe        # 只读诊断，不写任何数据
+不想记参数就用向导：
+
+```PowerShell
+# PowerShell
+..\dist\usbsetup-r2.exe
 ```
 
-常用选项：`--output-dir`（产物目录，支持 `%TEMP%`）、`--source-dir`（分支 A 的本地备份源）、
-`--threshold`（容量阈值，支持 `10GiB`/`10GB`）、`--max-total`（打包上限，`0` 表示不限制）、
-`--name`（客户端标识，写入内嵌配置便于溯源）、`--config`（以某份配置文件为基础）、`--force`。
+#### 第四步：部署到目标机器
 
-**实现机制**：把 `usbbackup-r2.exe` 复制一份，在文件末尾追加一个带 SHA-256 校验和的配置块
-（PE 文件尾部追加数据不影响运行，自解压安装包用的是同一招）。客户端启动时从自身读取该块。
-生成器不要求目标机器有 Go 工具链。
+把 `client.exe` 与 `client.json` **放在同一个目录**，然后：
 
-**为什么这么设计**：生成器在**你的机器**上跑一次，产出的客户端自带一切；
-目标机器上没有可改的配置文件，也就无法通过改配置来改变客户端行为。
-客户端模式下 `--config` 会被明确忽略并在输出中提示。
+```CMD
+REM 目标机器 · CMD（管理员）
+cd C:\backup-agent
+client.exe accept --yes
+client.exe run
+```
 
-**内嵌内容只有配置与公钥**：任何把私钥塞进客户端的尝试都会被拒绝
-（`embedcfg.EnsureNoSecret`），因为客户端会落在他人可控的机器上，内嵌即等于公开。
+`accept` 只需做一次（首次会展示完整安全警告并要 `I AGREE`）。之后 `run` 静默常驻。
 
-### 4.2 主程序 `usbbackup-r2`
+想让它开机自动跑，注册成服务（需管理员）：
 
-| 子命令 | 说明 |
+```CMD
+REM 目标机器 · CMD（管理员）
+client.exe install-service
+client.exe start
+client.exe status
+```
+
+> 服务模式下 `%LOCALAPPDATA%` 指向的是**系统配置目录**，不是用户目录。部署时一律用**绝对路径**，别依赖环境变量展开。
+
+#### 第五步：取回并解密（在你的机器上）
+
+```PowerShell
+# PowerShell（放着私钥的那台机器）
+cd D:\backup
+..\dist\usbunseal-r2.exe init --cred .\client.json --key .\keys\usbbackup-r2.key.pem --out-dir D:\restore
+..\dist\usbunseal-r2.exe ls                                  # 看看远端有什么
+..\dist\usbunseal-r2.exe pull --pass                          # 取最新一个并解密
+```
+
+`pull` 默认只取**最新一个**对象（对应"我刚插过一次盘"这个最常见的场景）；要补历史加 `--all`。下载 → 校验容器头 → 解密 → 解压，一条命令走完，中间产物放临时目录、用完即删。
+
+想改成"在 Linux 上取回"，见 [4.3.1](#431-在-linux-上取回备份)。
+
+### 4.2 生成器 `usbkeygen-r2`
+
+| 子命令 | 作用 |
 |---|---|
-| `run` | 前台常驻运行（事件驱动 + 轮询兜底），Ctrl+C 退出 |
-| `once --drive E:` | 对单个盘符执行一次作业（验证与排障用） |
-| `list [--all]` | 列出可移动卷及其容量 |
-| `probe --drive E:` | 只读诊断：卷信息 + 私钥检测结论 + 将走哪个分支（**不写任何数据**） |
-| `config-check` | 校验配置与运行环境（源目录、输出目录可写、公钥、审计目录、源守卫） |
-| `install-service` / `uninstall-service` | 注册 / 删除 Windows 服务（需管理员） |
-| `start` / `stop` / `status` | 控制已注册的服务 |
+| `generate` | 生成 RSA 密钥对（`--bits` / `--pass` / `--pass-file` / `--out` / `--force`） |
+| `use <公钥>` | 把已有公钥登记进配置 |
+| `inspect <公钥>` | 看位数与指纹 |
+| `selftest` | 就地跑一遍加密→解密往返，不落盘 |
+| `cred` | 生成 `client.json`：默认 DPAPI；`--cred-pass-file` / `--cred-pass` 出口令加密（跨平台）；`--plain-file` 出明文 |
+| `r2-check` | 用凭据做一次探活 + 权限范围检查 |
+| `build-client` | 产出内嵌配置与公钥的客户端 exe |
+| `install-usb` | 组装一个便携工具 U 盘 |
+`build-client` 的覆盖项：`--output-dir` / `--threshold` / `--max-total` / `--collect` / `--upload` / `--no-upload` / `--cred-name` / `--name`。客户端模式**忽略**外部 config.json 与环境变量——否则"硬编码配置"就能靠改配置绕过去。
+
+### 4.3 解密器 `usbunseal-r2`
+
+命令行风格刻意对齐 `git`：`init` 生成配置、`config` 查看配置、`ls` 列远端、`pull` 取回并解密。
+
+| 子命令 | 需要私钥 | 作用 |
+|---|---|---|
+| `init` | 否 | 生成配置骨架（只登记路径与开关，**不含任何凭据材料**） |
+| `config` | 否 | 打印生效配置 + 关键文件是否存在 + 凭据保护方式 |
+| `ls [前缀]` | 否 | 列出远端对象（相当于 `git ls-remote`，需要可读的凭据） |
+| `pull [对象键]` | 是 | 从 R2 下载 + 解密 + 解压（相当于 `git pull`） |
+| `list <文件.usbk>` | 否 | 只读容器头：版本、算法、公钥指纹、分块数 |
+| `verify <文件.usbk> --key <私钥>` | 是 | 校验完整性，不解出明文 |
+| `unseal <文件.usbk> -d <目录> --key <私钥>` | 是 | 解密并解压本地容器 |
+
+`pull` 的常用开关：`--latest`（默认）/ `--all` / `--object <键>` / `--skip-existing`（默认开，重跑幂等）/ `--keep-container`（保留下载的密文）/ `--delete-remote`（解密成功后删远端，默认不动）/ `--dry-run`。
+
+配置默认在 `~/.config/usbbackup-r2/unseal.json`（Windows 上为 `%AppData%\usbbackup-r2\unseal.json`）：
+
+```json
+{
+  "format": "usbbackup-r2-unseal/v1",
+  "scheme_version": 1,
+  "prefix": "usb/",
+  "cred_file": "/home/me/.config/usbbackup-r2/client.json",
+  "cred_pass_file": "/home/me/.config/usbbackup-r2/cred.pass",
+  "key_file": "/home/me/.config/usbbackup-r2/usbbackup-r2.key.pem",
+  "key_pass_file": "/home/me/.config/usbbackup-r2/key.pass",
+  "out_dir": "/home/me/usb-restore",
+  "skip_existing": true
+}
+```
+
+生成时可以直接把这些填进去，不必手改 JSON：
+
+```Linux
+usbunseal-r2 init --cred ~/.config/usbbackup-r2/client.json \
+  --cred-pass ~/.config/usbbackup-r2/cred.pass \
+  --key  ~/.config/usbbackup-r2/usbbackup-r2.key.pem \
+  --key-pass ~/.config/usbbackup-r2/key.pass \
+  --out-dir ~/usb-restore
+```
+
+`init` 会当场检查两件最容易漏的事：**凭据是口令加密但 `cred_pass_file` 是空的**、**私钥带口令但 `key_pass_file` 是空的**——这两种配置注定跑不起来。
+
+#### 4.3.1 在 Linux 上取回备份
+
+取回备份的人通常不在生成备份的那台 Windows 机器前，所以解密器提供 `linux/amd64` 与 `linux/arm64` 两个原生产物（`./build.sh linux` 产出，`dist/usbunseal-r2-linux-*`）。注意**只有解密器参与交叉编译**：其余四件依赖 Windows 专有的卷/服务 API。
+
+Linux 上没有 DPAPI，因此有一条硬约束：
+
+> **DPAPI 保护的 `client.json` 在 Linux 上读不了。** 要给 Linux 用的凭据必须用口令加密生成。
+
+完整流程（在一台 Linux 机器上，比如树莓派）：
+
+```Linux
+# 1) 在 Windows 生成器上产出一份"跨平台可读"的凭据（口令从文件读，不上命令行）
+#    PowerShell：
+#    usbkeygen-r2 cred --out .\client.json --cred-pass-file .\cred.pass
+
+# 2) 把 client.exe 用不到的东西拷到 Linux：
+#    client.json（口令加密）、cred.pass（口令文件）、私钥、usbunseal-r2-linux-*
+chmod 600 cred.pass key.pass client.json
+
+# 3) 生成配置并取回
+usbunseal-r2 init --cred ~/.config/usbbackup-r2/client.json \
+  --cred-pass ~/.config/usbbackup-r2/cred.pass \
+  --key ~/.config/usbbackup-r2/usbbackup-r2.key.pem
+usbunseal-r2 config          # 先看清生效配置与凭据保护方式
+usbunseal-r2 ls              # 列出远端有哪些产物
+usbunseal-r2 pull            # 取最新一个并解密解压
+```
+
+口令文件的替代来源（适合 systemd / 脚本）：环境变量 `USBBACKUP_R2_CRED_PASSPHRASE`、`USBBACKUP_R2_CRED_PASSPHRASE_FILE`。两者都**不如口令文件**——`/proc/<pid>/environ` 对同机同用户与 root 可读，`ps eww` 也可能带出来。单用户机器可以接受，多用户机器请用 `cred_pass_file`。
+
+### 4.4 主程序 `usbbackup-r2`（同时也是客户端）
+
+| 子命令 | 作用 |
+|---|---|
+| `run` | 前台常驻（事件驱动为主，轮询兜底） |
+| `once --drive E:` | 对指定盘符执行一次 |
+| `list [--all]` | 列出卷与容量 |
+| `probe --drive E:` | 只读诊断：这个盘会被怎么处理（不写数据、不发请求） |
+| `upload <产物.usbk>` | 手工补传本地产物到 R2 |
+| `cred-check` | 检查 `client.json` 能否在本机解开 |
+| `config-check` | 校验配置与运行环境 |
+| `install-service` / `start` / `stop` / `status` | 服务管理（需管理员） |
+| `accept` | 首次知情同意 |
 | `version` | 版本信息 |
 
-`run` / `once` 选项：
+`upload` 只接受本工具产出的 `.usbk`（会校验容器魔数）——免得它被当成"任意文件上传器"，把凭据变成通用写入通道。上传后是否保留本地由 `--keep` 控制。
 
-| 选项 | 说明 |
-|---|---|
-| `--dry-run` | 只做检测与门控判定，不写入任何数据 |
-| `--poll-only` | 强制仅用轮询通道（排障用；默认事件驱动） |
-| `--allow-fixed` | 允许对固定磁盘执行作业。**仅供验证与排障**，生产不要开启 |
-| `--overwrite` | 回写时覆盖目标同名文件（默认跳过） |
-| `--verify-hash` | 回写后按 SHA-256 逐文件校验 |
-| `--service` | 以 Windows 服务方式运行（由 SCM 调用，勿手工执行） |
-| `--simulate-arrival E:` | 注入一次模拟的"卷到达"事件，用于在没有物理介质时验证完整链路 |
+### 4.5 压缩器 `usbcomp-r2`
 
-> 建议：第一次在任何机器上运行前，先 `usbbackup-r2 probe --drive <盘符>` 确认判定结果符合预期。
-> 该命令**只读**，不写任何数据。本机没有可移动介质时，可用
-> `usbbackup-r2 once --drive C: --allow-fixed --dry-run` 验证判定与门控逻辑。
-
-### 4.2.1 注册为 Windows 服务（需管理员）
-
-```powershell
-cd D:\path\to\usbbackup-r2
-.\usbbackup-r2.exe install-service
-.\usbbackup-r2.exe start
-.\usbbackup-r2.exe status
+```PowerShell
+# PowerShell
+cd D:\backup
+..\dist\usbcomp-r2.exe pack D:\some\dir -o .\out.usbk --public .\keys\usbbackup-r2.pub.pem
 ```
 
-服务启动类型为**手动**（不会自动开机启动）。要开机自启请显式执行
-`sc.exe config usbbackup-r2 start= auto` —— 本工具刻意不代劳（见 `REQUIREMENTS.md` G-07）。
+源目录 → 流式 zip → 混合加密 → 单一 `.usbk`。源目录全程只读。加 `--keep-plain-zip` 才会额外保留明文 zip（默认不落盘）。
 
-> **部署注意（实测发现）**：服务以 `LocalSystem` 运行，此时 `%LOCALAPPDATA%` 解析为
-> `C:\Windows\System32\config\systemprofile\AppData\Local`，而不是当前用户的目录。
-> 因此服务部署**必须**在 `config.json` 里写**绝对路径**（配置、密钥、输出目录、日志），
-> 或把 `--config` 指向绝对路径的配置文件。否则会出现"日志不知道去哪了"。
+### 4.6 便携工具盘
 
-### 4.3 压缩器 `usbcomp-r2`
+把工具装到一个 U 盘上，走到哪台机器都能跑：
 
-```powershell
-.\usbcomp-r2.exe pack D:\重要资料 -o D:\out\mybackup.usbk
+```PowerShell
+# PowerShell（管理员）
+..\dist\usbkeygen-r2.exe install-usb `
+  --drive I: `
+  --subdir backup\tools `
+  --keys D:\backup\keys `
+  --cred D:\backup\client.json `
+  --force
 ```
 
-`--store` 全部不压缩、`--exclude <模式>` 追加排除项（可重复）、`--threads` 并发度提示、
-`--keep-plain-zip` 额外保留明文 zip、`--quiet` 不输出进度。
-源目录 → 流式 zip → 混合加密 → 单一 `.usbk`。源目录全程只读。
+盘内布局：
 
-### 4.4 解压器 `usbunseal-r2`
-
-```powershell
-# 查看容器头（无需私钥）
-.\usbunseal-r2.exe list D:\out\mybackup.usbk
-
-# 校验完整性（不解出明文）
-.\usbunseal-r2.exe verify D:\out\mybackup.usbk --key .\usbbackup-r2.key.pem --pass
-
-# 解密并解压到指定目录
-.\usbunseal-r2.exe unseal D:\out\mybackup.usbk -d D:\restore --key .\usbbackup-r2.key.pem
+```
+I:\
+├── .usbbackup-allow        ← 授权标记，必须留在**盘根**
+└── backup\tools\
+    ├── usbsetup-r2.exe / usbkeygen-r2.exe / usbunseal-r2.exe / usbbackup-r2.exe / usbcomp-r2.exe
+    ├── client.exe           内嵌配置与公钥
+    ├── client.json          R2 凭据（可选；⚠ DPAPI 只对生成它的那台机器有效）
+    ├── keys\usbbackup-r2.pub.pem
+    ├── keys\usbbackup-r2.key.pem（默认带；--without-private 可排除）
+    └── README.txt
 ```
 
-`--dry-run` 只校验条目不写入、`--force` 覆盖已存在文件、`--keep-zip` 只解出明文 zip。
+**`.usbbackup-allow` 是豁免标记，语义是"别采集我"**：工具盘上放着私钥，一旦被采集打包上传就等于把私钥发布到网上。所以这个标记必须在盘根——豁免判定只在 `<盘根>\.usbbackup-allow` 处 `Stat` 一次，挪进子目录就检测不到，这个盘就会被当成普通介质采集走。
 
-安全设计：目标目录必须显式指定；默认不覆盖已存在文件；拒绝一切可能逃逸目标目录的条目名（Zip Slip 防护）；
-对"解压炸弹"设有单条目与总量双上限；解密失败时统一报错，不区分「密钥错误」与「数据被篡改」。
+`--without-private` 让私钥不上盘；`--cred` 给了就会顺手打开客户端的上传能力并把凭据一起放进去。
 
 ---
 
 ## 5. 配置
 
-配置文件默认位于 `%LOCALAPPDATA%\usbbackup-r2\config.json`，也可用 `--config` 指定。
+### 5.1 R2 侧的准备与权限（重要）
 
-优先级：**命令行 flag > 环境变量 `USBBACKUP_R2_*` > `config.json` > 内置默认值**。
+**这里有一条必须说清楚的现实**，否则你会按不存在的权限档位去配：
+
+R2 控制台能签发的**长效 API token 只有四档权限**：
+
+| 权限 | 范围 | 能做什么 |
+|---|---|---|
+| `Admin Read & Write` | 账户级 | 建/删桶、改桶配置、读写所有桶 ❌ **不要用** |
+| `Admin Read only` | 账户级 | 列举桶、看桶配置 ❌ **不要用** |
+| `Object Read & Write` | **桶级** | 该桶的读、写、列举 ✅ **用这个** |
+| `Object Read only` | **桶级** | 该桶的读、列举 |
+
+也就是说：
+
+- **没有"只写不读"这一档**。最小可达权限是 `Object Read & Write`，它同时能读、能覆盖、能删除。
+- **可限定的维度是桶，不是 key 前缀**。想真正限定前缀只能用 Temporary Access Credentials（`POST /accounts/{id}/r2/temp-access-credentials`，支持 `prefixes`），但它 **TTL 上限 7 天**，不适合无人值守的常驻客户端。
+
+所以本项目的落地形态是 **`Object Read & Write` + 仅限目标桶**，并配套两件事：
+
+1. **给桶开启版本控制（Object Versioning）**——因为这一档能覆盖和删除，版本控制让"覆盖/误删"不销毁历史版本。**这不是可选项，是前提。**
+2. **定期轮换 token**——换一份 `client.json` 就完事，不需要重新编译客户端。
+
+`r2-check` 会用 `ListBuckets` 帮你判断 token 是不是账户级：**能列举桶 = Admin 权限 = 开大了**，报 WARN。
+
+**残余风险，必须知道**：上传凭据泄漏后，持有者不仅能上传伪造对象，还能**读取已有密文、覆盖或删除对象**。前者由端到端加密兜住（没有私钥读不出明文），后者由版本控制兜住。
+
+### 5.2 本项目实际使用的 R2 参数
+
+| 项 | 值 |
+|---|---|
+| 账户 ID | `aacbb6abba999cde14c3ddcce80ec425` |
+| S3 端点 | `https://aacbb6abba999cde14c3ddcce80ec425.r2.cloudflarestorage.com` |
+| 桶 | `usbbackup` |
+| 对象键前缀 | `usb/` |
+| 自定义域 | `usbbackup.immml.top` |
+| 签名区域 | `auto`（R2 固定值，不要改） |
+
+对象键形态：`usb/<UTC时间戳>_<净化后的卷标>.zip.usbk`，例如 `usb/20260918T143739Z_OS.zip.usbk`。
+
+把上面这些填成一份 `r2.json`，之后所有 `cred` 命令都可以用 `--from r2.json` 一次带全（`secret_access_key` 留空则仍会交互询问，推荐就这么留）：
 
 ```json
 {
-  "backup_source_dir": "%USERPROFILE%\\usbbackup-r2-source",
+  "account_id": "aacbb6abba999cde14c3ddcce80ec425",
+  "bucket": "usbbackup",
+  "endpoint": "https://aacbb6abba999cde14c3ddcce80ec425.r2.cloudflarestorage.com",
+  "region": "auto",
+  "prefix": "usb/",
+  "access_key_id": "<你的 Access Key ID>",
+  "secret_access_key": "",
+  "label": "office-pc"
+}
+```
+
+> 注意 `endpoint` **只写协议与主机**，不要带 `/usbbackup` 这段路径——桶名的唯一去处是 `bucket` 字段。带路径会被**明确拒绝**（不是忽略）：S3 客户端按 path-style 自己拼 `/<bucket>/<key>`，端点里的路径会被整段丢掉，于是"我写了桶名"和"实际请求去了哪"从此对不上，而且不会报错。纯粹的尾斜杠（`…com/`）是允许的，与不写路径等价。
+
+> **自定义域 `usbbackup.immml.top` 的用途待确认**：如果把它接成**公开读**的域名，任何人只要知道对象键就能下载密文——内容读不出来（没有私钥），但卷标与时间戳这类元数据会暴露。如果只是给解密器取回用，**不要设成公开**：`usbunseal-r2 pull` 走的是 S3 API 签名请求，不需要公开域名。
+
+### 5.3 配置项
+
+配置文件默认在 `%LOCALAPPDATA%\usbbackup-r2\config.json`。以下是内置默认值的全量导出（`usbbackup-r2 config-check` 会打印生效值）：
+
+```json
+{
   "output_dir": "%TEMP%\\backup",
-  "public_key_path": "C:\\ProgramData\\usbbackup-r2\\keys\\usbbackup-r2.pub.pem",
-  "authorized_backup_subdir": "backup",
+  "public_key_path": "%LOCALAPPDATA%\\usbbackup-r2\\keys\\usbbackup-r2.pub.pem",
   "audit_file": "%LOCALAPPDATA%\\usbbackup-r2\\audit.jsonl",
+
   "monitor": {
     "poll_interval_sec": 5,
     "debounce_sec": 5,
@@ -415,226 +497,298 @@ cd D:\path\to\usbbackup-r2
     "process_mounted_on_start": true,
     "poll_only": false
   },
-  "detect": {
-    "mode": "both",
-    "max_depth": 4,
-    "max_files": 5000,
-    "max_headers_bytes": 4096,
-    "timeout_sec": 20,
-    "marker_file": ".usbbackup-r2-allow",
-    "scan_contents": true,
-    "extra_name_patterns": [],
-    "extra_content_markers": []
+
+  "collect": {
+    "policy": "all",
+    "marker_file": ".usbbackup-collect",
+    "exempt_marker_file": ".usbbackup-allow"
   },
+
   "gate": {
-    "used_threshold": "10GiB",
     "used_threshold_bytes": 10737418240,
+    "used_threshold": "",
     "max_total_bytes": 10737418240,
     "free_space_margin_percent": 5
   },
+
   "archive": {
     "store_already_compressed": true,
     "keep_plain_zip": false,
-    "excludes": [],
+    "excludes": null,
     "threads": 0
   },
-  "retention": { "keep_per_volume": 5, "dedup_enabled": true },
-  "log": { "level": "info", "file": "...", "max_size_mb": 10, "max_backups": 5, "console": true }
+
+  "retention": {
+    "keep_per_volume": 5,
+    "dedup_enabled": true
+  },
+
+  "upload": {
+    "enabled": false,
+    "credential_file": "%LOCALAPPDATA%\\usbbackup-r2\\client.json",
+    "multipart_threshold_bytes": 67108864,
+    "part_size_bytes": 67108864,
+    "max_retries": 5,
+    "upload_timeout_min": 30,
+    "delete_local_after_upload": true,
+    "keep_local_on_failure": true
+  },
+
+  "log": {
+    "level": "info",
+    "file": "%LOCALAPPDATA%\\usbbackup-r2\\logs\\usbbackup-r2.log",
+    "max_size_mb": 10,
+    "max_backups": 5,
+    "console": true
+  }
 }
 ```
 
-支持的 `USBBACKUP_R2_*` 环境变量：
-`USBBACKUP_R2_BACKUP_SOURCE_DIR`、`USBBACKUP_R2_OUTPUT_DIR`、`USBBACKUP_R2_PUBLIC_KEY`、`USBBACKUP_R2_LOG_LEVEL`、
-`USBBACKUP_R2_AUDIT_FILE`、`USBBACKUP_R2_USED_THRESHOLD`（人类可读，如 `10GiB`）、
-`USBBACKUP_R2_USED_THRESHOLD_BYTES`、`USBBACKUP_R2_MAX_TOTAL_BYTES`、`USBBACKUP_R2_POLL_INTERVAL_SEC`。
+两点值得说明：
 
-路径支持 `%VAR%` 与 `${VAR}` 展开。配置优先级冲突时高优先级生效，并以 DEBUG 级记录来源。
+- `upload.enabled` 默认 **false**：模板程序默认只落本地（行为与不含出站能力的版本一致）。生成器产出的客户端才会显式打开它。
+- `upload.credential_file` 默认是 `%LOCALAPPDATA%` 下的绝对路径；**生成器产出的客户端把它设成相对名 `client.json`**，按"与 exe 同目录"解析——这样现场只要把两个文件一起拷过去就行。
 
-### 容量阈值与打包上限
-
-`gate` 段有两个值，含义不同：
+### 5.4 两个阈值，别搞混
 
 | 字段 | 含义 | 默认 | 比较对象 |
 |---|---|---|---|
-| `used_threshold` / `used_threshold_bytes` | 超过就**不备份** | `10GiB` | 卷的已占用容量 |
-| `max_total_bytes` | 超过就**不打包** | `10GiB`（`0` 表示不限制） | 待打包的数据量（同样是已占用容量） |
+| `gate.used_threshold_bytes` | 超过就**不备份** | 10 GiB | 已占用容量 |
+| `gate.max_total_bytes` | 超过就**不打包** | 10 GiB（`0` = 不限制） | **待打包数据量（即已占用）**，不是介质容量 |
 
-**单位可以写清楚**，避免裸字节数写错位数：
+上限若误比卷总容量，64 GiB 的盘只用了 500 MiB 也会被跳过——正好和意图相反。已有回归测试锁住这一点。
 
-- `"10GiB"` / `"10G"` → 10 × 1024³（二进制，Windows 资源管理器口径）
-- `"10GB"` → 10 × 1000³（十进制，硬盘厂商标称口径）
-- 还支持 `KiB` / `MiB` / `TiB` / `KB` / `MB` / `TB` 与小数（如 `1.5TiB`）
+也支持可读写法 `gate.used_threshold = "10GiB"`（或环境变量 `USBBACKUP_R2_USED_THRESHOLD=10GiB`）。
 
-两种写法表达同一件事，**只写其中一种**。同时写且含义不一致时配置校验会直接报错。
+### 5.5 两个标记，语义相反
 
-> 注意：`max_total_bytes` 比的是**待打包的数据量**，不是介质容量。
-> 一块 64 GiB 的 U 盘只用了 500 MiB 会正常备份；反之若拿容量来比，
-> 大容量小占用的盘会被全部跳过，与意图相反。
+| 标记 | 位置 | 含义 | 有无它 |
+|---|---|---|---|
+| `.usbbackup-allow` | **盘根**（只认盘根） | "这块盘是我自己的，别动它" | 有 → **豁免**，任何策略档位下都不采集 |
+| `.usbbackup-collect` | **盘根** | "这块盘的内容可以打包上传" | 仅 `marker_only` 档位使用 |
 
-### 授权标记（可选，比启发式更确定）
+豁免判定**不受策略档位影响**，任何档位都先做这一步。原因很实际：工具盘上放着私钥，一旦被采集上传就等于把私钥发布到网上——这是本项目最不能出的事故，不允许"因为策略是 all 所以跳过豁免检查"这种组合存在。
 
-在 U 盘根目录放一个 `.usbbackup-r2-allow`，内容为已登记公钥的指纹：
+### 5.6 环境变量
 
+`USBBACKUP_R2_*` 系列可覆盖同名配置项（共 15 个）：
+
+```PowerShell
+# PowerShell
+$env:USBBACKUP_R2_OUTPUT_DIR          = 'D:\out'
+$env:USBBACKUP_R2_PUBLIC_KEY          = 'D:\backup\keys\usbbackup-r2.pub.pem'
+$env:USBBACKUP_R2_AUDIT_FILE          = 'D:\backup\audit.jsonl'
+$env:USBBACKUP_R2_LOG_LEVEL           = 'debug'
+$env:USBBACKUP_R2_COLLECT_POLICY      = 'marker_only'
+$env:USBBACKUP_R2_COLLECT_MARKER      = '.usbbackup-collect'
+$env:USBBACKUP_R2_COLLECT_EXEMPT_MARKER = '.usbbackup-allow'
+$env:USBBACKUP_R2_USED_THRESHOLD      = '10GiB'
+$env:USBBACKUP_R2_USED_THRESHOLD_BYTES = '10737418240'
+$env:USBBACKUP_R2_MAX_TOTAL_BYTES     = '0'
+$env:USBBACKUP_R2_POLL_INTERVAL_SEC   = '5'
+$env:USBBACKUP_R2_UPLOAD_ENABLED      = 'true'
+$env:USBBACKUP_R2_CREDENTIAL_FILE     = 'D:\backup\client.json'
+$env:USBBACKUP_R2_UPLOAD_PART_SIZE    = '67108864'
+$env:USBBACKUP_R2_UPLOAD_MAX_RETRIES  = '5'
 ```
-fingerprint=1a2b 3c4d 5e6f ...
+
+凭据文件口令另有两个变量（**不是**配置项，只在读/写凭据文件时生效）：
+
+```Linux
+export USBBACKUP_R2_CRED_PASSPHRASE='...'            # 直接给口令（会出现在 /proc/<pid>/environ 里）
+export USBBACKUP_R2_CRED_PASSPHRASE_FILE=~/.config/usbbackup-r2/cred.pass   # 指向"首行为口令"的文件，推荐
 ```
 
-只要该指纹与配置中的公钥一致，就判定为「已授权」，无需依赖文件名/内容启发式。
-**该标记只使用公钥指纹，全程不涉及任何私钥材料。**
+优先级：显式参数（`--cred-pass-file`）> 口令文件 > `USBBACKUP_R2_CRED_PASSPHRASE` > `USBBACKUP_R2_CRED_PASSPHRASE_FILE`。显式指定永远赢过环境。
 
-### 审计日志
+**客户端模式（内嵌配置）下上面那 15 个 `USBBACKUP_R2_*` 配置变量全部被忽略**——否则"硬编码配置"就能靠设几个环境变量绕过去。但 `USBBACKUP_R2_CRED_PASSPHRASE*` 这两个**在客户端模式下仍然生效**：它们不是配置，是"怎么解开凭据文件"的输入，客户端照样需要。凭据是 DPAPI 时用不到它们。
 
-`audit.jsonl`（JSON Lines）每行一条记录，包含：时间、盘符、卷标、文件系统、卷序列号、容量、走的分支、
-`has_keyfile` 布尔值与命中计数、扫描文件数、产物名、结果、耗时。
+### 5.7 审计日志
 
-**审计记录不含私钥内容、不含私钥文件名、不含文件清单、不含任何文件内容。**
+`audit.jsonl`，一行一条 JSON。字段刻意裁剪过：
+
+```json
+{"time":"2026-09-18T22:37:39+08:00","tool":"usbbackup-r2","root":"X:\\","label":"OS",
+ "fs":"NTFS","serial":123456789,"total_bytes":0,"used_bytes":0,
+ "branch":"archive-encrypt","collect_policy":"all","collected":true,"exempt_marker":false,
+ "files":2,"raw_bytes":5019,"cipher_bytes":5216,
+ "r2_object_key":"usb/20260918T143739Z_OS.zip.usbk","r2_bucket":"usbbackup",
+ "uploaded_bytes":5216,"upload_result":"uploaded","local_product":"deleted",
+ "ok":true,"duration_sec":0.07}
+```
+
+**没有**文件名、没有文件清单、没有文件内容、没有 token、没有签名头、没有 URL query。有一条针对**结构体定义本身**的回归测试守着这件事——不是对某一条序列化结果做的，因为后者换个用例就绕过去了。
 
 ---
 
 ## 6. 安全提示
 
-1. **私钥与口令丢了就找不回来。** 本工具不提供后门、密钥托管或找回机制。请把私钥与口令离线备份（离线介质 + 纸质记录）。
-2. **先验证，再生产。** 在把本工具用于重要数据之前，请先在非生产环境中跑一遍 `probe` / `once`。
-3. **备份源目录要干净。** 授权分支会把本地「备份文件夹」内容写入 U 盘，请确认该目录不含你不希望扩散的数据。
-4. **明文 zip 是敏感的。** 默认不落盘；若使用 `--keep-plain-zip`，请在使用后立即安全删除明文产物。
-5. **启用 BitLocker / 设备加密**能进一步防止介质丢失后的离线读取——本工具保护的是备份产物，不是整个磁盘。
-6. **明文私钥落盘的风险**：`generate` 默认输出未加密的 PKCS#8 私钥。如需口令保护，请加 `--pass`。
-   注意：本工具的口令保护采用自有格式（`USBGUARD ENCRYPTED PRIVATE KEY`，PBKDF2-SHA256 60 万次 + AES-256-GCM），
-   与 `openssl` 的 PBES2 格式**不互通**；这样做是为了避免使用弱 KDF。
-7. **Go 的 `rsa.PrivateKey` 无法彻底内存清零**（标准库不提供该 API），本工具只做了尽力而为的字段清除。
-   真正的防护依赖操作系统内存隔离与进程生命周期管理。
-8. **配置文件只保存公钥。** `usbkeygen-r2 use` 会拒绝任何私钥输入。
+### 不做什么
+
+- **不加壳、不免杀、不隐藏进程/窗口/端口、不写自启动**（服务默认手动启动）。
+- **不做 UAC 绕过、不提权、不规避 EDR/杀软**。
+- **不引入入站监听、不接受远程指令、没有控制通道、不做内容心跳**。
+- **不把 Secret Access Key 编译进 exe**。生成器遇到这种请求直接拒绝并说明理由。
+- **私钥检测只做存在性布尔判定**：只看文件名模式与文件头最多 4 KiB 的字节特征，绝不读取、解析、复制、缓存或外传私钥内容；头部缓冲区用后清零。
+- **日志与审计不记录私钥的文件名、路径或内容**。
+
+### 出站面
+
+唯一允许的出站目标是配置的 R2 endpoint，仅 HTTPS 且强制证书校验（**没有**跳过校验的开关）。除它之外不发起任何网络调用。容器文件被包装成只有 `PUT` / `HEAD` / `GET` / `DELETE` / `ListObjectsV2` 这几条路径的 S3 客户端，不接受任意 URL 与任意方法。
 
 ### 信任边界
 
-| 在信任边界内 | 在信任边界外 |
+| 谁 | 能拿到什么 |
 |---|---|
-| 本机操作系统与当前用户账户 | 目标介质上的既有数据（被当作不可信输入解析） |
-| 本工具自身二进制 | 归档条目名（解包时全部校验后才落盘） |
-| 已登记的**公钥** | 私钥（只在解密/生成时显式提供，不持久化） |
+| 客户端所在机器上的**普通用户** | 内嵌公钥 + 加密的凭据文件（读也读不出内容） |
+| 客户端所在机器上的**本机管理员/SYSTEM** | 可以以该机器身份解开 DPAPI，从而拿到 R2 凭据 |
+| 拿到**口令加密**凭据 + 口令文件的人 | 直接用 R2 凭据（所以口令文件要与凭据分开放） |
+| 拿到 `client.exe` 的人 | 只有公钥，**解不开任何密文** |
+| 拿到 `.usbk` 密文的人 | 没有私钥就是一堆字节 |
+| 拿到私钥的人 | 全部备份 |
+
+**必须承认的事实**：任何落在目标机器上的凭据都存在被提取的可能，尤其是具备本机管理员权限的主体。本项目的防护目标是**把损失面压到最小 + 让轮换成本接近零**，不是声称"不可提取"。轮换的动作是「控制台吊销 token + 在目标机器上重新生成 `client.json`」，**不需要重新编译或重新分发客户端**。
+
+### 三种凭据保护方式，怎么选
+
+| 方式 | 强度 | 跨机器 | 什么时候用 |
+|---|---|---|---|
+| DPAPI（默认） | 与机器绑定 | ❌ | 客户端跑在生成它的那台 Windows 上 |
+| 口令加密 | 取决于口令 | ✅ | 要给 Linux 解密器用，或客户端在另一台机器上 |
+| 明文（`--plain-file`） | 只有 0600 权限 | ✅ | 既没有 DPAPI 又无法在启动时提供口令时的最后手段 |
+
+**明文凭据不会自动被读取**：`cred.Load` 要求调用方显式传 `--allow-plain-cred`（解密器）/ `WithAllowPlainFile`（代码）。目的是让"文件忘了加密"变成一个当场可见的错误，而不是一个谁都没注意到的默认行为。
+
+**口令文件不要和凭据放在同一目录**：放在一起，口令文件就只是给加密凭据配了一把"同级的钥匙"，实际强度退回明文。分开放才有意义。
+
+### 部署前的检查清单
+
+- [ ] R2 token 用的是 `Object Read & Write` + 仅限目标桶，**不是** Admin 档
+- [ ] 桶已开启**版本控制**
+- [ ] `r2-check` 通过（含权限范围检查）
+- [ ] `probe --drive <盘符>` 的判定结论符合预期
+- [ ] 私钥已离线备份，且**不在**客户端分发的目录里
+- [ ] 工具盘上的 `.usbbackup-allow` 在盘根
+- [ ] 测试过一次完整的「采集 → 上传 → pull → 解密还原」
 
 ---
 
 ## 7. 项目结构
 
 ```
-usbbackup-r2/
+usbguard-r2/
 ├── cmd/
-│   ├── usbbackup-r2/        常驻主程序（监控 / 编排 / 诊断）
-│   ├── usbkeygen-r2/        生成器（密钥对生成 + 公钥选择 + 产出客户端）
-│   ├── usbsetup-r2/         交互式生成向导（一问一答，产出同一个客户端）
-│   ├── usbcomp-r2/          压缩器（带混合加密）
-│   └── usbunseal-r2/        解压器（解密 + 解压）
+│   ├── usbbackup-r2/     主程序 / 客户端（run / once / probe / upload / 服务管理）
+│   ├── usbkeygen-r2/     生成器（generate / cred / r2-check / build-client / install-usb）
+│   ├── usbsetup-r2/      交互式向导
+│   ├── usbunseal-r2/     解密器（init / config / ls / pull / list / verify / unseal）
+│   └── usbcomp-r2/       压缩器
 ├── internal/
-│   ├── winmon/          设备插入事件监控（Windows 消息 + 轮询兜底）
-│   ├── winvol/          卷类型 / 容量 / 门控 / 盘符枚举
-│   ├── keyfile/         私钥存在性检测（文件名 + 内容特征 + 授权标记）
-│   ├── copier/          授权分支：本地备份回写
-│   ├── archive/         流式 zip 打包与安全解包（含 Zip Slip 防护）
-│   ├── crypto/          混合加密容器（读 / 写 / 解析）
-│   ├── keystore/        密钥生成、加载、指纹、口令保护
-│   ├── backup/          流水线编排、产物命名、审计
-│   ├── clientgen/       客户端生成逻辑（keygen 与 setup 共用同一份）
-│   ├── embedcfg/        PE 尾部配置块的内嵌与校验
-│   ├── agreement/       首次确认记录（accept / --check / --revoke）
-│   ├── winsvc/          Windows 服务注册与控制
-│   ├── config/          配置加载 / 校验 / 合并
-│   ├── logx/            分级日志 + 大小轮转
-│   ├── cli/             安全警告横幅、无回显口令输入、退出码
-│   ├── fsutil/          Windows 路径工具（长路径 / 净化 / 包含关系）
-│   └── version/         构建期注入的版本信息
-├── REQUIREMENTS.md      基础需求表（功能点 / 优先级 / 异常处理 / 安全注意事项）
-├── REQUIREMENTS-R2.md   R2 上传能力需求表（上传 / 凭据保护 / 采集策略）
-├── DISCLAIMER.md        免责声明
-├── LICENSE              CC BY-NC-SA 4.0
-├── build.ps1            PowerShell 构建（`-Test` 一并跑检查）
-└── build.sh             跨 shell 构建（Git Bash / WSL）
+│   ├── backup/           流水线编排 + 上传编排 + 保留策略 + 审计
+│   ├── collectpolicy/    采集准入判定（豁免标记 + 三档策略）
+│   ├── config/           配置加载 / 环境变量 / 校验 / 摘要
+│   ├── cred/             凭据保护（DPAPI / 口令加密 / 明文，同一文件格式三种模式）
+│   ├── crypto/           混合加密内核（不感知 USB/文件系统语义）
+│   ├── r2/               S3 客户端（手写 SigV4、分片上传、重试、下载）
+│   ├── archive/          流式 zip / 排除规则 / 解压与 Zip Slip 防护 / 源守卫
+│   ├── keystore/         RSA 密钥生成、PEM 读写、口令保护、指纹
+│   ├── clientgen/        客户端生成（内嵌配置与公钥）
+│   ├── embedcfg/         PE overlay 内嵌配置块（带 SHA-256 校验 + 私钥守卫）
+│   ├── agreement/        首次知情同意
+│   ├── cli/              参数解析与全局开关重排
+│   ├── fsutil/           路径、净化、长路径、原子写
+│   ├── logx/             日志
+│   ├── version/          版本与产品名
+│   ├── winmon/           卷到达事件监控（隐藏顶层窗口 + WM_DEVICECHANGE）
+│   ├── winsvc/           Windows 服务控制
+│   └── winvol/           卷枚举、容量、门控判定
+├── build.ps1 / build.sh
+├── README.md / TUTORIAL.md / REQUIREMENTS.md / REQUIREMENTS-R2.md / DISCLAIMER.md
+└── dist/                 构建产物
 ```
+
+依赖方向单向，不成环：
+
+```
+cmd/*   →  internal/{backup, cli, config, cred, winsvc, keystore, crypto,
+                     archive, r2, embedcfg, clientgen, winmon, winvol, fsutil, logx, version}
+backup  →  {collectpolicy, winvol, archive, crypto, config, cred, r2, fsutil, keystore, logx}
+archive / r2 / winmon / winvol / keystore / cred / crypto → fsutil, config
+```
+
+`internal/crypto` 是纯加密内核，不感知 USB 或文件系统语义。`internal/r2` 只讲 S3 协议，不知道"备份"是什么。`internal/collectpolicy` 单独成包，是因为它承载的是一条**安全语义**（什么情况下允许把一块盘打包上传），只应在一个地方被定义、被验证、被引用。
 
 ---
 
 ## 8. 开发状态
 
-| 阶段 | 内容 | 状态 |
+| 里程碑 | 内容 | 状态 |
 |---|---|---|
-| M0 | 需求表 + 开发环境 + 骨架 + 文档三件套 + Git | ✅ 完成 |
-| M1 | `crypto` 混合加密容器 + `keystore` 密钥管理 | ✅ 完成（含单测） |
-| M2 | `archive` 流式打包 / 安全解包执行器 + `copier` 复制执行器 | ✅ 完成（含单测） |
-| M3 | `winvol` 卷信息与门控 + `keyfile` 私钥存在性检测 | ✅ 完成（含单测） |
-| M4 | `winmon` 设备监控 + `backup` 流水线 + `winsvc` 服务化 | ✅ 完成（含单测） |
-| M5 | 5 个 CLI + 构建脚本 + Windows 实机验证 | ✅ 完成 |
-| M6 | `internal/cred`（DPAPI 凭据）+ `internal/r2`（SigV4 / 分片 / 重试） | ⬜ 待开始 |
-| M7 | `internal/collectpolicy` 采集策略 + 客户端流程改造 + 生成器 R2 参数 | ⬜ 待开始 |
-| M8 | 真实 R2 桶实机验证 | ⬜ 待开始 |
+| M0 | 需求澄清与决策记录 | ✅ |
+| M1 | 卷枚举、容量门控、源守卫 | ✅ |
+| M2 | 卷到达事件监控（Win32） | ✅ |
+| M3 | 流式打包 + 混合加密内核 | ✅ |
+| M4 | 密钥管理、配置、命令行、免责声明 | ✅ |
+| M5 | 客户端生成与内嵌配置；服务注册 | ✅ |
+| M6 | 凭据保护（DPAPI） | ✅ |
+| M7 | R2 上传（SigV4 / 分片 / 重试 / 核对） | ✅ |
+| M8 | 采集策略、上传编排、解密器拉取 | ✅ |
+| M9 | 跨平台凭据（口令加密 / 明文）+ Linux 解密器（`init`/`config`/`ls`/`pull`，amd64 + arm64） | ✅ |
 
-全部模块均有单元测试覆盖，`go vet ./...` 与 `go test ./...` 全绿。
-M6~M8 的详细条目见 [`REQUIREMENTS-R2.md`](REQUIREMENTS-R2.md) §8。
+测试：**17 个包有测试，共 218 个用例**。核心路径全在上——容量门控、卷标净化、路径守卫与 Zip Slip、加解密往返、篡改/截断/错误密钥拒绝、SigV4 官方已知答案向量、假 S3 端到端（含分片与 Abort）、采集策略与豁免、上传编排与本地去留矩阵、内嵌配置往返与私钥守卫、凭据三种保护方式（DPAPI / 口令 / 明文）的往返与拒绝路径、配置文件的按键合并。
 
-### 8.1 与 `UsbBackUP` 的独立化说明
+### 8.1 两处独立交叉验证
 
-本项目原先由 `UsbBackUP` 的完整历史派生而来，2026-09-18 已**彻底独立**：
+上传这条链路最容易"看起来对、其实错"，所以关键环节做了双重独立验证：
 
-- **产品标识全部改到 `usbbackup-r2`**：程序集名、服务名、配置目录、环境变量前缀、
-  授权标记、回写清单、密钥默认名、五个可执行文件名（详见 §0）。
-  现在两者可同机共存，不会互相覆盖或误认介质。
-- **Git 历史重新初始化**：不再是对方的提交链延续，从单一初始提交开始。
-- **容器格式刻意不动**（`USBK` / v1 / OAEP label `usbbackup/v1`），
-  两个项目的 `.usbk` 互相可解。
+1. **SigV4 签名**：用 AWS 官方已知答案向量锁死（`get-vanilla` → `5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31`、`get-vanilla-query-order-key-case` → `b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500`），并用独立的 Python（`hmac` + `hashlib`）实现复算交叉核对。
+2. **假 S3 服务端**：自带**独立实现**的规范请求拼装与 HMAC 计算（不复用被测代码），每收到一个请求都会复算签名与 `x-amz-content-sha256` 并比对。这样能抓出被测实现里的转义或排序错误。
 
-### 8.2 实机验证记录
+### 8.2 本机没有可移动介质时的验证手段
 
-以下场景均以**真实二进制**跑通（不只是单测）：
+- `subst X: <目录>` + `--allow-fixed` 造出一块可写的固定卷（端到端测试就是这么跑的）；
+- `--simulate-arrival X:` 注入一次模拟的卷到达事件，跑通"监控 → 队列 → 流水线"的完整链路。
 
-| 场景 | 结果 |
-|---|---|
-| 容量门控：已占用 193 GiB > 阈值 10 GiB | 正确跳过，审计记录 `branch=skipped` / `skip_reason=used-over-threshold` |
-| 分支 B：整盘打包 + 混合加密 | 生成 `VOL_X.zip.usbk`；`unseal` 解出后与原始目录**逐字节一致** |
-| 分支 A：介质含 `id_rsa` | 识别为已授权，回写 3 个文件到 `\backup\`，源目录零改动，清单已生成 |
-| 常驻 `run`（事件通道 + 模拟到达） | 两个分支均正确执行，作业队列串行化生效 |
-| 单实例互斥 | 第二个实例被拒，退出码 4 |
-| Zip Slip | 真实构造含 `../` 与绝对路径条目的容器 → 2 个条目被阻断，无文件逃出目标目录，退出码 5 |
-| 错误私钥 / 篡改 / 截断 | 全部被拒绝 |
-| Windows 服务 | install → start（STATE 4 RUNNING）→ stop → uninstall 全链路通过，卸载后无残留 |
+两条都只用于验证与排障，生产环境不要开启。
 
 ### 8.3 由"跑一遍"发现并修复的缺陷
 
-这些缺陷**单测无法发现**，全部是实际运行才暴露的：
+单测没有发现、实际跑起来才暴露的问题（这类问题在本项目里出现过 8 次）：
 
-| # | 缺陷 | 后果 |
-|---|---|---|
-| 1 | `fsutil.IsSubPath` 对卷根重复追加分隔符（`E:\` → `E:\\`） | 子路径判定恒为假，源守卫与自复制守卫**双双失效** |
-| 2 | `winvol.Query` 对非可移动卷提前返回 | 容量/就绪全为 0，诊断输出无用 |
-| 3 | Go `flag` 包遇位置参数即停止解析 | `usbkeygen-r2 use <路径> --config x`、`usbcomp-r2 pack <目录> -o out` 全部失效 |
-| 4 | 容器头把算法方案标为固定 `RSA-4096` | 与实际 2048 位密钥不符，误导运维 |
-| 5 | `DEV_BROADCAST_VOLUME.dbcv_size` 用 `unsafe.Sizeof` 填充 | Go 结构体对齐补到 20 字节（C 结构为 18），`RegisterDeviceNotificationW` 返回 `ERROR_INVALID_DATA`，事件通道完全不可用 |
-| 6 | 服务模式仍要求 `I AGREE` 交互确认 | SCM 拉起进程立即退出，报 1053「服务没有及时响应启动或控制请求」 |
-| 7 | 直接转述 `sc.exe` 输出 | 中文系统下 sc.exe 输出 GBK，按 UTF-8 解码成乱码；改为翻译退出码 + 只取 ASCII 行 |
+1. `WM_DEVICECHANGE` 的接收窗口不能是 `HWND_MESSAGE`——消息专用窗口收不到广播，必须建一个隐藏的顶层窗口（`WS_POPUP`，不设 `WS_VISIBLE`）。
+2. `RegisterDeviceNotificationW` **不支持** `DBT_DEVTYP_VOLUME`（返回 `ERROR_INVALID_DATA`），卷到达只能靠默认广播。
+3. Go 结构体因对齐会补齐，**不能用 `unsafe.Sizeof` 填 C 侧 size 字段**（`DEV_BROADCAST_VOLUME` 固定 18 字节）。
+4. Go 的 `URL.EscapedPath()` 不会转义 `+ : = @ & $ , ;`，而 SigV4 要求全部百分号编码——直接用会让含这些字符的对象键被拒签。
+5. `url.Values.Encode()` 把空格编成 `+`，SigV4 要求 `%20`——查询串必须手写编码。
+6. 分片上传失败时若不用 `context.WithoutCancel` 发 `AbortMultipartUpload`，`ctx` 已取消会导致 abort 也失败，远端留下**计费的**残留分片。
+7. `sc.exe` 的输出是本地化的（中文系统是 GBK），直接转述会乱码——要翻译退出码并只取 ASCII 行。
+8. `objectURL` 会整体覆盖 URL 的 `Path`（path-style 只能由 `bucket` + `key` 拼出），所以**端点里带的路径会被静默丢弃**：写成 `https://<acct>.r2.cloudflarestorage.com/usbbackup` 照样"跑通"，只是请求打到了 `/<bucket>/…` 而不是你写的那段路径。发现方式是拿假 S3 打印实际收到的 `bucket` / `key`，看到路径被吞掉。修法是在 `cred.ValidateEndpoint` 里**拒绝**带路径的端点（而不是继续忽略），并把校验提到"询问 Secret 之前"。
 
-另外修正了一处**设计假设错误**：卷到达事件不能通过消息专用窗口 +
-`RegisterDeviceNotificationW` 获取（消息专用窗口不在广播范围，且 `DBT_DEVTYP_VOLUME`
-不是合法过滤器类型），已改为隐藏的顶层窗口接收默认广播。详见 `REQUIREMENTS.md` D-01。
+### 8.4 与 `UsbBackUP` 的独立化说明
+
+本仓库从 `UsbBackUP` 派生，但**不共享代码**。派生时做的主要改动：
+
+- 新增 `internal/r2`（手写 S3 客户端）与 `internal/cred`（凭据保护，Win 上 DPAPI、Linux 上口令加密）；
+- 新增 `internal/collectpolicy`（替代原来的私钥存在性检测分支判定）；
+- **移除** `internal/keyfile` 与 `internal/copier`（私钥检测与回写分支）；
+- `internal/backup` 的流水线由"双分支"改成"单一采集链路 + 可选上传"，新增 `upload.go`；
+- `internal/clientgen` 去掉回写源目录，加入上传开关与凭据名（`UploadEnabled` / `CredentialFile`）。
 
 ---
 
 ## 9. 许可
 
-本项目采用 **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International（CC BY-NC-SA 4.0）** 协议。
-
-- **署名（BY）** —— 再分发或改编时必须保留原作者署名与本声明
-- **非商业性使用（NC）** —— 不得将本项目或其改编作品用于任何商业用途
-- **相同方式共享（SA）** —— 改编作品必须以相同协议分发
-
-协议全文见 [LICENSE](LICENSE) 或 <https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode>。
+见 `LICENSE`。
 
 ---
 
 ## 10. 免责声明
 
-**本软件按「现状」（AS IS）提供，不附带任何形式的明示或默示担保。**
-作者与贡献者不对因使用本软件产生的任何直接、间接、附带、特殊、惩罚性或后果性损害承担责任，
-包括但不限于数据丢失、数据损坏、数据泄露、业务中断、设备损坏或利润损失。
+**使用前请完整阅读 `DISCLAIMER.md`**。首次运行任一程序时会要求输入 `I AGREE` 确认。
 
-使用者须自行确保其使用行为符合所在国家/地区的法律法规，并自行承担全部法律后果。
-本工具的合法使用范围仅限于**你个人自有、或你有完全管理权的**计算机设备，以及**你个人自有**的可移动存储介质。
+要点：
 
-完整条款见 [DISCLAIMER.md](DISCLAIMER.md)。
+- 本工具会**读取被采集介质的全部内容**并上传到你配置的对象存储。**只在你拥有或已获得明确授权的设备与介质上使用。**
+- 加密强度取决于你的密钥管理。**私钥丢失 = 备份不可恢复**，本项目不提供任何后门或恢复途径。
+- 上传凭据由你自行在云侧创建与授权，权限配置不当造成的后果由你承担。
+- 作者不对数据丢失、凭据泄漏、误用或任何间接损失负责。
