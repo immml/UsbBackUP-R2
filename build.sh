@@ -110,8 +110,16 @@ if [ "$WITH_LINUX" = "1" ]; then
     f="$DIST/usbunseal-r2-linux-$arch"
     head -c 4 "$f" | od -An -tx1 | grep -q "7f 45 4c 46" \
       || { echo "ERROR: $f 不是 ELF（GOOS/GOARCH 可能写错）" >&2; exit 1; }
+    # 补可执行位。go build 在 Windows 上产出的文件没有 +x，
+    # 用 scp -p / tar / rsync 保持权限地拷到 Linux 后会直接 Permission denied；
+    # 现场第一反应往往是去查依赖，白折腾一轮。
+    #
+    # 注意：MSYS/Git Bash 挂载 NTFS 时 chmod 可能是空操作（模式位看起来没变），
+    # 所以 README/TUTORIAL 的部署步骤里仍然写了 `chmod +x`，别把这里当成保证。
+    # 在 WSL/Linux 上执行本脚本时这一步是有效的。
+    chmod 0755 "$f" 2>/dev/null || true
   done
-  echo "ELF 校验通过"
+  echo "ELF 校验通过（并已补上可执行位）"
 fi
 
 echo ""

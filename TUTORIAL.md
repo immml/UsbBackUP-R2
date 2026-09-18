@@ -444,19 +444,22 @@ Linux 上没有 DPAPI，所以有一条硬约束：
 ```Linux
 # Linux
 mkdir -p ~/.config/usbbackup-r2 && cd ~/.config/usbbackup-r2
-# 从 Windows 拷过来：client-linux.json、cred.pass、usbbackup-r2.key.pem、key.pass
+# 从 Windows 拷过来：client-linux.json、cred.pass、usbbackup-r2.key.pem、key.pass、
+# 以及 usbunseal-r2-linux-amd64（或 -arm64）。
+# Windows 上产出的文件没有可执行位，且 ls 在 NTFS 上不会显示它——记得补一次：
+chmod +x usbunseal-r2-linux-amd64
 chmod 600 cred.pass key.pass client-linux.json
 
-./usbunseal-r2 init \
+./usbunseal-r2-linux-amd64 init \
   --cred ~/.config/usbbackup-r2/client-linux.json \
   --cred-pass ~/.config/usbbackup-r2/cred.pass \
   --key ~/.config/usbbackup-r2/usbbackup-r2.key.pem \
   --key-pass ~/.config/usbbackup-r2/key.pass \
   --out-dir ~/usb-restore
 
-./usbunseal-r2 config        # 先看清生效配置与凭据保护方式
-./usbunseal-r2 ls            # 列远端
-./usbunseal-r2 pull          # 取最新一个并解密解压
+./usbunseal-r2-linux-amd64 config     # 先看清生效配置与凭据保护方式
+./usbunseal-r2-linux-amd64 ls         # 列远端
+./usbunseal-r2-linux-amd64 pull       # 取最新一个并解密解压
 ```
 
 口令的其它来源（适合 systemd 单元 / 定时脚本）：环境变量 `USBBACKUP_R2_CRED_PASSPHRASE` 或 `USBBACKUP_R2_CRED_PASSPHRASE_FILE`。两者都**不如口令文件**——`/proc/<pid>/environ` 对同机同用户与 root 可读，`ps eww` 也可能带出来。单用户机器能接受，多用户机器请用 `cred_pass_file`。

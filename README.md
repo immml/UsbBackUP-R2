@@ -342,18 +342,24 @@ Linux 上没有 DPAPI，因此有一条硬约束：
 #    PowerShell：
 #    usbkeygen-r2 cred --out .\client.json --cred-pass-file .\cred.pass
 
-# 2) 把 client.exe 用不到的东西拷到 Linux：
+# 2) 把用得到的东西拷到 Linux：
 #    client.json（口令加密）、cred.pass（口令文件）、私钥、usbunseal-r2-linux-*
+#    Windows 上产出的文件没有可执行位，且 ls 在 NTFS 上不会显示它——
+#    拷完补一次，或改用 tar/scp -p 保持权限：
+tar -cf - usbunseal-r2-linux-amd64 | ssh box 'tar -xf -'      # 保持权限的拷法
+chmod +x usbunseal-r2-linux-amd64
 chmod 600 cred.pass key.pass client.json
 
 # 3) 生成配置并取回
-usbunseal-r2 init --cred ~/.config/usbbackup-r2/client.json \
+./usbunseal-r2-linux-amd64 init --cred ~/.config/usbbackup-r2/client.json \
   --cred-pass ~/.config/usbbackup-r2/cred.pass \
   --key ~/.config/usbbackup-r2/usbbackup-r2.key.pem
-usbunseal-r2 config          # 先看清生效配置与凭据保护方式
-usbunseal-r2 ls              # 列出远端有哪些产物
-usbunseal-r2 pull            # 取最新一个并解密解压
+./usbunseal-r2-linux-amd64 config     # 先看清生效配置与凭据保护方式
+./usbunseal-r2-linux-amd64 ls         # 列出远端有哪些产物
+./usbunseal-r2-linux-amd64 pull       # 取最新一个并解密解压
 ```
+
+嫌名字长就改名成 `usbunseal-r2` 放进 `PATH`（`mv usbunseal-r2-linux-amd64 ~/bin/usbunseal-r2`）。
 
 口令文件的替代来源（适合 systemd / 脚本）：环境变量 `USBBACKUP_R2_CRED_PASSPHRASE`、`USBBACKUP_R2_CRED_PASSPHRASE_FILE`。两者都**不如口令文件**——`/proc/<pid>/environ` 对同机同用户与 root 可读，`ps eww` 也可能带出来。单用户机器可以接受，多用户机器请用 `cred_pass_file`。
 
