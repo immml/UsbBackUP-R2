@@ -1,14 +1,20 @@
-// Command usbunseal-r2 是解压器：用私钥解密容器并解压。
+// Command usbunseal-r2 是解密器：从 R2 取回容器并解密还原，或解密本地容器。
 //
-// 用法：
+// 用法（git 风格子命令）：
 //
+//	usbunseal-r2 init                      生成配置骨架
+//	usbunseal-r2 config                    打印生效配置
+//	usbunseal-r2 ls [前缀]                  列出远端可用产物（不需要私钥）
+//	usbunseal-r2 pull [对象键] [--all]      从 R2 下载并自动解密解压
+//	usbunseal-r2 unseal <容器.usbk> -d <目录> --key <私钥>
+//	usbunseal-r2 verify <容器.usbk> --key <私钥>
 //	usbunseal-r2 list <容器.usbk>
-//	usbunseal-r2 verify <容器.usbk> --key <私钥.pem> [--pass]
-//	usbunseal-r2 unseal <容器.usbk> -d <目标目录> --key <私钥.pem> [--force]
-//	usbunseal-r2 version
 //
-// 对应需求 F-B01 ~ F-B07。安全设计：目标目录必须显式指定；
-// 拒绝一切逃逸目标目录的条目名（Zip Slip）；解密失败统一报错不区分原因。
+// 配置放在 ~/.config/usbbackup-r2/unseal.json（Windows 为 %AppData%\usbbackup-r2\），
+// 命令行参数覆盖配置文件。对应需求 F-B01 ~ F-B10。
+//
+// 安全设计：目标目录必须显式指定（或来自配置文件）；拒绝一切逃逸目标目录的
+// 条目名（Zip Slip）；解密失败统一报错不区分原因。
 package main
 
 import (
@@ -17,6 +23,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/immml/UsbBackUP-R2/internal/archive"
@@ -53,6 +61,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cli.ExitOK
 	}
 
+	// init 也不碰密钥（只写路径），但仍属于"会改磁盘上的东西"，
+	// 所以照样走一次告示流程，保持一致。
 	_, skipConfirm := cli.ExtractGlobalFlags(args)
 	if skipConfirm {
 		cli.RenderNotice(stdout, toolName)
@@ -68,6 +78,22 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdVerify(rest, stdout, stderr)
 	case "unseal":
 		return cmdUnseal(rest, stdout, stderr)
+	case "init":
+		return cmdInit(rest, stdout, stderr)
+	}
+
+	// 需要"远端"的子命令共用一个配置加载路径。
+	cfg, cfgPath, cfgSource, code := loadConfigForRun(args, stdout)
+	if code != cli.ExitOK {
+		return code
+	}
+	switch sub {
+	case "ls", "remote":
+		return cmdLs(rest, cfg, cfgPath, cfgSource, stdout, stderr)
+	case "pull":
+		return cmdPull(rest, cfg, cfgPath, cfgSource, stdout, stderr)
+	case "config":
+		return cmdConfig(rest, cfg, cfgPath, cfgSource, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "未知子命令 %q\n\n", sub)
 		printUsage(stderr)
@@ -76,14 +102,43 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 func printUsage(w io.Writer) {
-	cli.PrintHelp(w, "usbunseal-r2 —— 解压器（解密 + 解压）", []string{
-		"用法：",
-		"  usbunseal-r2 list <容器.usbk>                         查看容器头（无需私钥）",
-		"  usbunseal-r2 verify <容器.usbk> --key <私钥>           仅校验完整性，不解出明文",
-		"  usbunseal-r2 unseal <容器.usbk> -d <目录> --key <私钥>  解密并解压到指定目录",
+	cli.PrintHelp(w, "usbunseal-r2 —— 解密器（从 R2 取回并解密，或解密本地容器）", []string{
+		"用法（git 风格）：",
+		"  usbunseal-r2 init [--out 路径]                        生成配置骨架（~/.config/usbbackup-r2/unseal.json）",
+		"  usbunseal-r2 config                                   打印生效配置与关键文件状态",
+		"  usbunseal-r2 ls [前缀]                                 列出远端可用产物（不需要私钥）",
+		"  usbunseal-r2 pull [对象键] [选项]                       从 R2 下载并自动解密解压",
+		"  usbunseal-r2 unseal <容器.usbk> -d <目录> --key <私钥>   解密本地已有的容器",
+		"  usbunseal-r2 list <容器.usbk>                          查看容器头（无需私钥）",
+		"  usbunseal-r2 verify <容器.usbk> --key <私钥>            仅校验完整性，不解出明文",
 		"  usbunseal-r2 version",
 		"",
-		"选项：",
+		"配置文件（字段留空即用内置默认值）：",
+		"  " + DefaultUnsealConfigPath(),
+		"  " + strings.SplitN(configTemplateComment, "\n", 2)[0],
+		"",
+		"ls / pull 选项：",
+		"  --cred string             R2 凭据文件（默认从配置/常见位置查找）",
+		"  --cred-pass-file string   凭据文件口令（首行）",
+		"  --allow-plain-cred        允许读取未加密的凭据文件（仅 0600 保护）",
+		"  --prefix string           对象键前缀（默认用凭据里配置的）",
+		"  --limit int               ls 最多列出多少个（0 表示不限）",
+		"  --show-config             先打印生效配置再执行",
+		"",
+		"pull 选项：",
+		"  --object string           只处理指定对象键（也可作为位置参数）",
+		"  --latest                  只取最新一个（默认行为）",
+		"  --all                     取回该前缀下的全部对象",
+		"  --out DIR                 解压目标目录",
+		"  --key string              私钥文件（或配置文件里的 key_file）",
+		"  --pass                    交互式输入私钥口令（无回显）",
+		"  --pass-file string        从文件读取私钥口令（首行）",
+		"  --skip-existing           目标目录已存在时跳过（默认开启，重跑幂等）",
+		"  --keep-container          解密后保留下载下来的 .usbk",
+		"  --delete-remote           解密成功后删除远端对象（默认不动远端）",
+		"  --dry-run                 只显示将要做什么",
+		"",
+		"unseal / verify 选项：",
 		"  --key string        私钥文件（PKCS#8 / PKCS#1 PEM）",
 		"  --pass              交互式输入私钥口令（无回显）",
 		"  --pass-file string  从文件读取口令（首行）",
@@ -92,20 +147,45 @@ func printUsage(w io.Writer) {
 		"  --keep-zip          只解出明文 zip，不再解压",
 		"",
 		"全局开关（可放在任意位置）：",
-		"  --config string     配置文件路径",
+		"  --config string     配置文件路径（默认 " + DefaultUnsealConfigPath() + "）",
 		"  --yes               跳过免责声明确认（自动化用）",
+		"",
+		"凭据口令的三种给法（按优先级）：",
+		"  --cred-pass-file <文件>  /  配置文件 cred_pass_file",
+		"  环境变量 " + credEnvPassphrase + "  /  " + credEnvPassphraseFile,
+		"  交互式提示（需要 TTY）",
 		"",
 		"安全说明：",
 		"  · 解包会拒绝一切可能逃逸目标目录的条目名（Zip Slip 防护）；",
-		"  · 目标目录必须显式指定，默认不覆盖已存在文件；",
-		"  · 解密失败时不区分「密钥错误」与「数据被篡改」，避免信息泄露。",
+		"  · 默认不覆盖已存在文件；",
+		"  · 解密失败时不区分「密钥错误」与「数据被篡改」，避免信息泄露；",
+		"  · 远端对象的生命周期默认由 bucket 侧的 lifecycle rule 管理，",
+		"    工具不会主动删除远端内容（除非显式加 --delete-remote）。",
+		"",
+		"平台：本二进制可在 Linux / Windows 上运行；" + platformNote(),
 	})
 }
 
+// platformNote 针对当前平台给一句使用提示。
+func platformNote() string {
+	if runtime.GOOS == "windows" {
+		return "Windows 上凭据可用 DPAPI 保护（与机器绑定）。"
+	}
+	return "本平台没有 DPAPI，凭据需用口令保护（cred_pass_file 或环境变量）。"
+}
+
+// credEnvPassphrase / credEnvPassphraseFile 是凭据口令的环境变量名。
+//
+// 取自 cred 包，避免文档与实际读的变量名不一致——这种不一致
+// 会让人照着帮助输一遍却没生效，且完全不报错。
+var (
+	credEnvPassphrase     = "USBBACKUP_R2_CRED_PASSPHRASE"
+	credEnvPassphraseFile = "USBBACKUP_R2_CRED_PASSPHRASE_FILE"
+)
+
 // cmdList 读取并展示容器头（F-B01）。不涉及任何密钥材料。
 func cmdList(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("list", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newFlagSet("list", stderr)
 	if err := cli.ParseArgs(fs, args); err != nil {
 		return cli.ExitUsage
 	}
@@ -153,8 +233,7 @@ type decryptArgs struct {
 
 // cmdVerify 仅校验完整性（F-B02），不落任何明文。
 func cmdVerify(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newFlagSet("verify", stderr)
 	key := fs.String("key", "", "私钥文件（必填）")
 	usePass := fs.Bool("pass", false, "交互式输入私钥口令")
 	passFile := fs.String("pass-file", "", "从文件读取口令")
@@ -206,8 +285,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 
 // cmdUnseal 解密并解压（F-B03 ~ F-B07）。
 func cmdUnseal(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("unseal", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newFlagSet("unseal", stderr)
 	dest := fs.String("d", "", "解压目标目录（必填）")
 	key := fs.String("key", "", "私钥文件（必填）")
 	usePass := fs.Bool("pass", false, "交互式输入私钥口令")
@@ -222,8 +300,16 @@ func cmdUnseal(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "用法：usbunseal-r2 unseal <容器.usbk> -d <目录> --key <私钥>")
 		return cli.ExitUsage
 	}
+	// 目标目录允许从配置文件取，但仍要求"有明确来源"——
+	// 静默落到当前目录是最容易把解密结果写到不该去的地方的一种行为。
 	if *dest == "" {
-		fmt.Fprintln(stderr, "错误：必须通过 -d 显式指定解压目标目录（防止误写到当前目录）。")
+		cfg, _, _, code := loadConfigForRun(args, nil)
+		if code == cli.ExitOK && strings.TrimSpace(cfg.OutDir) != "" {
+			*dest = cfg.OutDir
+		}
+	}
+	if *dest == "" {
+		fmt.Fprintln(stderr, "错误：必须显式指定解压目标目录（-d <目录>，或在配置文件里设 out_dir）。")
 		return cli.ExitUsage
 	}
 	if *key == "" {
@@ -270,7 +356,7 @@ func cmdUnseal(args []string, stdout, stderr io.Writer) int {
 		return cli.ExitOK
 	}
 
-	// 解密到内存受限的临时文件：zip 需要随机访问中央目录（io.ReaderAt + 长度）。
+	// 解密到临时文件：zip 需要随机访问中央目录（io.ReaderAt + 长度）。
 	tmp, err := os.CreateTemp("", "usbbackup-r2-unseal-*.zip")
 	if err != nil {
 		fmt.Fprintf(stderr, "错误：无法创建临时文件：%v\n", err)
@@ -350,9 +436,14 @@ func loadPrivateKey(path string, usePass bool, passFile string, stderr io.Writer
 
 	k, err := keystore.LoadPrivateKey(path, passphrase)
 	if err != nil {
-		if strings.Contains(err.Error(), "口令") {
-			fmt.Fprintf(stderr, "私钥加载失败：%v（可加 --pass 或 --pass-file）\n", err)
-		} else {
+		followed := func(e error) bool {
+			if strings.Contains(e.Error(), "口令") {
+				fmt.Fprintf(stderr, "私钥加载失败：%v（可加 --pass 或 --pass-file）\n", e)
+				return true
+			}
+			return false
+		}
+		if !followed(err) {
 			fmt.Fprintf(stderr, "私钥加载失败：%v\n", err)
 		}
 		return nil, cli.ExitRuntime
@@ -378,3 +469,6 @@ func wipePrivate(k *rsa.PrivateKey) {
 		}
 	}
 }
+
+var _ = flag.ContinueOnError
+var _ = filepath.Separator

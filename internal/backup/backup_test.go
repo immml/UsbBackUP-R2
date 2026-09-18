@@ -98,10 +98,9 @@ func TestAppendAudit(t *testing.T) {
 		FreeBytes:    60 << 30,
 		UsedBytes:    4 << 30,
 		Branch:       BranchArchive,
-		HasKeyfile:   false,
-		KeyfileHits:  0,
-		ScannedFiles: 123,
 		Product:      "MyUSB.zip.usbk",
+		Collected:    true,
+		UploadResult: Uploaded,
 		OK:           true,
 	}
 	if err := AppendAudit(path, rec); err != nil {
@@ -144,13 +143,68 @@ func TestAppendAuditRejectsEmptyPath(t *testing.T) {
 
 func TestBranchConstants(t *testing.T) {
 	seen := map[Branch]bool{}
-	for _, b := range []Branch{BranchAuthorized, BranchArchive, BranchSkipped, BranchFailed} {
+	for _, b := range []Branch{BranchArchive, BranchSkipped, BranchFailed} {
 		if seen[b] {
 			t.Fatalf("分支常量重复: %s", b)
 		}
 		seen[b] = true
 		if b == "" {
 			t.Fatal("分支常量不应为空")
+		}
+	}
+}
+
+// G-02 回归防护：审计结构体里不得出现任何"文件名清单"性质的字段。
+//
+// 这条测试是对着**结构体定义**做的，而不是对着某一条序列化结果——
+// 后者只要换个用例就绕过去了。
+func TestAuditRecordHasNoSensitiveFields(t *testing.T) {
+	raw, err := json.Marshal(AuditRecord{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.ToLower(string(raw))
+	for _, forbidden := range []string{
+		"filename", "file_list", "filelist", "path_list", "pathlist",
+		"paths", "entries", "private_key", "keyfile_name", "content",
+		"access_key", "secret", "token", "signature", "authorization",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("审计字段名含禁止项：%q", forbidden)
+		}
+	}
+}
+
+func TestObjectKeyIsStampedAndNormalized(t *testing.T) {
+	at := time.Date(2026, 9, 18, 13, 40, 0, 0, time.UTC)
+
+	got := ObjectKey("usb/", "MyUSB.zip.usbk", at)
+	if got != "usb/20260918T134000Z_MyUSB.zip.usbk" {
+		t.Fatalf("对象键 = %q", got)
+	}
+	// 前缀没写结尾斜杠时也要补上：漏补会把 usb 与文件名粘成 usb2026…。
+	if got := ObjectKey("usb", "a.usbk", at); !strings.HasPrefix(got, "usb/") {
+		t.Fatalf("前缀未规范化：%q", got)
+	}
+	// 同一块盘的多次采集不能撞键，否则远端会静默覆盖上一次备份。
+	if ObjectKey("usb/", "a.usbk", at) == ObjectKey("usb/", "a.usbk", at.Add(time.Second)) {
+		t.Fatal("不同时刻应产生不同的对象键")
+	}
+}
+
+// 对象键的名字字段来自卷标，属于不可信输入：必须挡住路径穿越。
+func TestObjectKeyRejectsTraversal(t *testing.T) {
+	at := time.Date(2026, 9, 18, 13, 40, 0, 0, time.UTC)
+	for _, bad := range []string{
+		`..\..\evil.usbk`, "../../evil.usbk", `C:\Windows\x.usbk`, "a/b/c.usbk",
+	} {
+		got := ObjectKey("usb/", bad, at)
+		rest := strings.TrimPrefix(got, "usb/")
+		if strings.Contains(rest, "..") {
+			t.Errorf("对象键 %q 名字部分仍含 ..（输入 %q）", got, bad)
+		}
+		if strings.ContainsAny(rest, `/\`) {
+			t.Errorf("对象键 %q 的名字部分仍含路径分隔符（输入 %q）", got, bad)
 		}
 	}
 }

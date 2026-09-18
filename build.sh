@@ -2,12 +2,19 @@
 # usbbackup-r2 build script (bash / Git Bash / WSL / Linux cross-compile).
 #
 # Usage:
-#   ./build.sh                  Build all 5 executables into ./dist/
+#   ./build.sh                  Build all 5 Windows executables into ./dist/
+#   ./build.sh linux            Also cross-compile usbunseal-r2 for linux/amd64 + linux/arm64
 #   ./build.sh -v 0.2.0         Set the version string
 #   ./build.sh -t               Run gofmt + go vet + go test first
 #   ./build.sh -c               Remove dist/ before building
 #
 # Standard library only: no network access, no dependency download.
+#
+# Why linux artifacts: 生成器与客户端跑在 Windows 上，但**取回备份的人**通常
+# 在一台 Linux 机器（或树莓派之类的 ARM 盒子）前。解密器因此要能原生跑在那里，
+# 而不是靠 wine 或虚拟机。只有 usbunseal-r2 参与交叉编译——其余四件都依赖
+# Windows 专有的卷/服务 API（internal/winvol、internal/winmon、internal/winsvc）。
+# 凭据在 Linux 上没有 DPAPI，需用口令保护（--cred-pass-file），详见 README。
 
 set -euo pipefail
 
@@ -17,14 +24,21 @@ DIST_OUT="dist"            # 传给 go.exe 的必须是**相对**路径，见下
 VERSION=""
 RUN_TESTS=0
 CLEAN=0
+WITH_LINUX=0
 
 while getopts "v:tch" opt; do
   case "$opt" in
     v) VERSION="$OPTARG" ;;
     t) RUN_TESTS=1 ;;
     c) CLEAN=1 ;;
-    h) sed -n '2,12p' "$0"; exit 0 ;;
+    h) sed -n '2,15p' "$0"; exit 0 ;;
     *) exit 1 ;;
+  esac
+done
+# 允许把 "linux" 作为非选项参数传进来（`./build.sh linux`）。
+for arg in "$@"; do
+  case "$arg" in
+    linux|--linux) WITH_LINUX=1 ;;
   esac
 done
 
@@ -81,6 +95,26 @@ export GOOS=windows GOARCH=amd64 CGO_ENABLED=0
 "$GO" build -trimpath -ldflags "$LD"                -o "$DIST_OUT/usbcomp-r2.exe"   ./cmd/usbcomp-r2
 "$GO" build -trimpath -ldflags "$LD"                -o "$DIST_OUT/usbunseal-r2.exe" ./cmd/usbunseal-r2
 
+if [ "$WITH_LINUX" = "1" ]; then
+  echo ""
+  echo "[5/5] cross-compile usbunseal-r2 for linux"
+  export CGO_ENABLED=0
+  for arch in amd64 arm64; do
+    GOOS=linux GOARCH="$arch" "$GO" build -trimpath -ldflags "$LD" \
+      -o "$DIST_OUT/usbunseal-r2-linux-$arch" ./cmd/usbunseal-r2
+  done
+  # 交叉编译只保证"编得过"。真正的运行验证要在目标机上做——
+  # 本机（Windows）跑不了 ELF，所以这里额外核对产物确实是目标架构的 ELF，
+  # 免得哪天 GOOS 写错却静默产出一个 PE。
+  for arch in amd64 arm64; do
+    f="$DIST/usbunseal-r2-linux-$arch"
+    head -c 4 "$f" | od -An -tx1 | grep -q "7f 45 4c 46" \
+      || { echo "ERROR: $f 不是 ELF（GOOS/GOARCH 可能写错）" >&2; exit 1; }
+  done
+  echo "ELF 校验通过"
+fi
+
 echo ""
 echo "build finished, artifacts in $DIST"
+ls -lh "$DIST"/usbunseal-r2-linux-* 2>/dev/null || true
 ls -lh "$DIST"/*.exe

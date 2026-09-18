@@ -172,6 +172,52 @@ func TestRenderBannerContainsRequiredNotices(t *testing.T) {
 	}
 }
 
+// 反向守卫（第二组）：横幅不得再描述**已被移除**的能力。
+//
+// 这条测试针对的是一类很特别的缺陷：功能删了、文案没删。用户读完
+// 警告后会以为"检测到私钥就会回写"，进而按错误的心智模型去用工具——
+// 而声明本身已经构成不实陈述。文案与能力必须同步，所以要有测试锁住。
+func TestBannerDoesNotClaimRemovedFeatures(t *testing.T) {
+	flat := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' || r == '\n' {
+			return -1
+		}
+		return r
+	}, WarningBanner)
+	flatShort := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' || r == '\n' {
+			return -1
+		}
+		return r
+	}, NoticeShort)
+
+	// 注意："回写"本身不列为禁用词——文案里有一句"本工具不包含把本机数据
+	// 回写进介质的功能"，那是一句**否定式澄清**，比不提更好。要禁的是断言
+	// 旧行为存在的那种表述，因此这里禁的是"回写分支"而不是"回写"。
+	for _, banned := range []string{
+		"私钥检测",     // keyfile 包已删除
+		"已授权分支",    // copier 包已删除
+		"未授权分支",    // 单分支了，没有"未授权"这个说法
+		"回写分支",     // 不存在任何"把本机数据写进介质"的路径
+		`\backup\`, // 那是回写目标目录，已不存在
+		"自动备份文件夹",  // 同上
+	} {
+		if strings.Contains(flat, banned) {
+			t.Errorf("横幅仍描述已移除的能力：%q", banned)
+		}
+		if strings.Contains(flatShort, banned) {
+			t.Errorf("简短提示仍描述已移除的能力：%q", banned)
+		}
+	}
+
+	// 正向：当前准入语义必须如实写出来——豁免标记与三档策略。
+	for _, must := range []string{".usbbackup-allow", "豁免", "marker_only", "off", "版本控制"} {
+		if !strings.Contains(flat, must) {
+			t.Errorf("横幅未披露当前准入语义的关键项 %q", must)
+		}
+	}
+}
+
 func TestRenderNoticeIsShort(t *testing.T) {
 	var buf bytes.Buffer
 	RenderNotice(&buf, "usbbackup-r2")

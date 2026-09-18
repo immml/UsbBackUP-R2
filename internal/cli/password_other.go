@@ -1,36 +1,18 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package cli
 
-import (
-	"bufio"
-	"fmt"
-	"io"
-	"os"
-	"strings"
-)
+// 除 Windows 与 Linux 之外的平台没有无回显实现。
+//
+// 这两个平台才是本项目的交付目标：Windows 跑客户端与生成器，
+// Linux 跑解密器。其余平台（darwin/bsd 等）保留这个兜底**只为让
+// `GOOS=xxx go vet ./...` 能跑通**，不作为交付能力——
+// 在这些平台上 ReadPassphrase 会明确告知输入未被隐藏。
 
-// ReadPassphrase 的非 Windows 兜底实现（仅用于让工具链在其它平台上可编译，
-// 不属于交付能力）。
+// IsTerminal 无平台实现时一律返回 false，让调用方走非交互路径。
+func IsTerminal(fd int) bool { return false }
+
+// ReadPassphrase 退化为普通读取（会提示未隐藏）。
 func ReadPassphrase(prompt string) ([]byte, error) {
-	fmt.Fprintf(os.Stderr, "%s（注意：当前输入未隐藏）", prompt)
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
-	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("读取口令失败: %w", err)
-	}
-	return []byte(strings.TrimRight(line, "\r\n")), nil
-}
-
-// ReadPassphraseFromFile 从文件读取口令。
-func ReadPassphraseFromFile(path string) ([]byte, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("读取口令文件失败 %s: %w", path, err)
-	}
-	s := string(raw)
-	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
-		s = s[:i]
-	}
-	return []byte(s), nil
+	return readPlainPassphrase(prompt)
 }

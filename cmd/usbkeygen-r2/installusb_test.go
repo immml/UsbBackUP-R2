@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"io"
 	"os"
@@ -11,8 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/immml/UsbBackUP-R2/internal/collectpolicy"
+	"github.com/immml/UsbBackUP-R2/internal/config"
 	"github.com/immml/UsbBackUP-R2/internal/embedcfg"
-	"github.com/immml/UsbBackUP-R2/internal/keyfile"
 	"github.com/immml/UsbBackUP-R2/internal/keystore"
 )
 
@@ -86,7 +88,7 @@ func TestAssembleToolkitWritesExpectedLayout(t *testing.T) {
 		"usbkeygen-r2.exe", "usbunseal-r2.exe", "client.exe",
 		filepath.Join("keys", "usbbackup-r2.pub.pem"),
 		filepath.Join("keys", "usbbackup-r2.key.pem"),
-		".usbbackup-r2-allow", "README.txt",
+		".usbbackup-allow", "README.txt",
 	}
 	for _, rel := range must {
 		if _, err := os.Stat(filepath.Join(dest, rel)); err != nil {
@@ -115,8 +117,9 @@ func TestToolkitClientIsReallyEmbedded(t *testing.T) {
 	}
 }
 
-func TestAllowMarkerMatchesConfiguredKey(t *testing.T) {
-	// 盘里的授权标记必须能被 keyfile 认出来，否则这个盘会被打包带走。
+func TestAllowMarkerExemptsToolkitFromCollection(t *testing.T) {
+	// 最高优先级的一条：工具盘上放着私钥，一旦被采集打包上传就等于把私钥发布到网上。
+	// 所以盘根必须写出授权标记，且**任何策略档位**下都要被判豁免。
 	_, pub, priv := writeTestKeys(t)
 	dest := t.TempDir()
 	if _, err := assembleToolkit(toolkitOptions{
@@ -125,7 +128,7 @@ func TestAllowMarkerMatchesConfiguredKey(t *testing.T) {
 	}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(filepath.Join(dest, ".usbbackup-r2-allow"))
+	raw, err := os.ReadFile(filepath.Join(dest, ".usbbackup-allow"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,8 +140,27 @@ func TestAllowMarkerMatchesConfiguredKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !keyfile.MatchAllowMarker(raw, fp) {
-		t.Fatal("授权标记与公钥指纹不匹配，工具盘会被当成普通盘打包")
+	// 标记内容写指纹只为便于人肉核对"这块盘是谁的"，判定不看内容。
+	if !strings.Contains(string(raw), fp) {
+		t.Errorf("授权标记应记录公钥指纹 %s，实际内容 %q", fp, string(raw))
+	}
+
+	for _, p := range []collectpolicy.Policy{collectpolicy.PolicyAll, collectpolicy.PolicyMarkerOnly} {
+		// ExemptMarker 留空 = 用策略包内置默认名。这样测的是"工具盘写出的名字
+		// 与豁免判定默认查找的名字确实一致"，而不是两处各写一个字符串碰巧相等。
+		d, err := collectpolicy.Decide(dest, collectpolicy.Options{Policy: p})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !d.ExemptMarkerChecked || !d.ExemptMarkerFound {
+			t.Errorf("策略 %s：授权标记未被识别，工具盘会被打包走", p)
+		}
+		if d.Collect {
+			t.Errorf("策略 %s：工具盘被判为可采集，私钥会被上传", p)
+		}
+		if d.Reason != collectpolicy.ReasonExempt {
+			t.Errorf("策略 %s：拒绝原因应为 %s，实际 %q", p, collectpolicy.ReasonExempt, d.Reason)
+		}
 	}
 }
 
@@ -178,7 +200,8 @@ func TestAssembleRefusesOverwriteWithoutForce(t *testing.T) {
 
 func TestAssembleToolkitIntoSubDir(t *testing.T) {
 	// 工具可以收进子目录，但授权标记必须留在盘根——
-	// keyfile 只在 <盘根>\.usbbackup-r2-allow 处检查标记，挪走就检测不到。
+	// 豁免判定只在 <盘根>\.usbbackup-allow 处 Stat 一次，挪走就检测不到，
+	// 这个盘（带着私钥）就会被当成普通介质打包上传。
 	_, pub, priv := writeTestKeys(t)
 	dest := t.TempDir()
 
@@ -200,7 +223,7 @@ func TestAssembleToolkitIntoSubDir(t *testing.T) {
 			t.Errorf("子目录内缺少 %s: %v", rel, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(dest, ".usbbackup-r2-allow")); err != nil {
+	if _, err := os.Stat(filepath.Join(dest, ".usbbackup-allow")); err != nil {
 		t.Errorf("授权标记必须在盘根: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dest, "usbunseal-r2.exe")); err == nil {
@@ -235,11 +258,11 @@ func TestCleanSubDirRejectsEscape(t *testing.T) {
 }
 
 func TestToolkitReadmeWarnsOnlyWhenPrivatePresent(t *testing.T) {
-	withPriv := toolkitReadme("aa bb cc", true, false)
+	withPriv := toolkitReadme("aa bb cc", true, false, false)
 	if !strings.Contains(withPriv, "明文私钥") {
 		t.Error("带明文私钥时应有风险提示")
 	}
-	without := toolkitReadme("aa bb cc", false, false)
+	without := toolkitReadme("aa bb cc", false, false, false)
 	if strings.Contains(without, "明文私钥") {
 		t.Error("不带私钥时不应出现私钥风险提示")
 	}
@@ -250,16 +273,94 @@ func TestToolkitReadmeWarnsOnlyWhenPrivatePresent(t *testing.T) {
 
 func TestToolkitReadmeDistinguishesEncryptedPrivate(t *testing.T) {
 	// 带口令的私钥不能再被描述成"明文"——盘上写错风险等级会误导现场的人。
-	enc := toolkitReadme("aa bb cc", true, true)
+	enc := toolkitReadme("aa bb cc", true, true, false)
 	if strings.Contains(enc, "明文私钥") {
 		t.Error("口令保护的私钥不应被写成明文")
 	}
 	if !strings.Contains(enc, "口令保护") {
 		t.Error("应说明私钥带口令保护")
 	}
-	plain := toolkitReadme("aa bb cc", true, false)
+	plain := toolkitReadme("aa bb cc", true, false, false)
 	if !strings.Contains(plain, "明文私钥") {
 		t.Error("明文私钥应如实标注")
+	}
+}
+
+func TestToolkitReadmeExplainsCredentialOnlyWhenPresent(t *testing.T) {
+	// DPAPI 凭据是机器范围的，换台机器就失效。README 不写清楚，
+	// 现场的人会以为"把这个盘换个机器插上就能自动上传"。
+	with := toolkitReadme("aa bb cc", false, false, true)
+	if !strings.Contains(with, "DPAPI") || !strings.Contains(with, "别的机器") {
+		t.Error("带凭据时应说明 DPAPI 与机器绑定")
+	}
+	if !strings.Contains(with, "吊销") {
+		t.Error("带凭据时应给出泄漏后的处置办法")
+	}
+	without := toolkitReadme("aa bb cc", false, false, false)
+	if strings.Contains(without, "DPAPI") {
+		t.Error("不带凭据时不应出现凭据说明")
+	}
+}
+
+func TestAssembleCopiesCredentialAndEnablesUpload(t *testing.T) {
+	// 给了 --cred 就要：① 凭据落到客户端同目录；② 生成的客户端真的打开上传。
+	// 只做其中一件都会让现场表现为"跑了但什么都没传上去"。
+	_, pub, priv := writeTestKeys(t)
+	credDir := t.TempDir()
+	credPath := filepath.Join(credDir, "cred.json")
+	if err := os.WriteFile(credPath, []byte(`{"x":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	if _, err := assembleToolkit(toolkitOptions{
+		Dest: dest, ToolDir: fakeToolDir(t),
+		PublicKeyPath: pub, PrivateKeyPath: priv,
+		WithClient: true, CredentialPath: credPath, Force: true,
+	}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "client.json")); err != nil {
+		t.Fatalf("凭据未随盘落地: %v", err)
+	}
+	got, err := embedcfg.Read(filepath.Join(dest, "client.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emb config.Config
+	if err := json.Unmarshal(got.ConfigJSON, &emb); err != nil {
+		t.Fatal(err)
+	}
+	if !emb.Upload.Enabled {
+		t.Error("给了凭据却没有在客户端里打开上传")
+	}
+	if emb.Upload.CredentialFile != "client.json" {
+		t.Errorf("内嵌凭据名应为相对名 client.json（客户端按自身目录解析），实际 %q",
+			emb.Upload.CredentialFile)
+	}
+}
+
+func TestAssembleWithoutCredentialKeepsUploadOff(t *testing.T) {
+	// 反面：不给凭据时客户端必须保持"只落本地"，
+	// 否则现场会拿到一个每次采集都报上传失败的程序。
+	_, pub, priv := writeTestKeys(t)
+	dest := t.TempDir()
+	if _, err := assembleToolkit(toolkitOptions{
+		Dest: dest, ToolDir: fakeToolDir(t),
+		PublicKeyPath: pub, PrivateKeyPath: priv,
+		WithClient: true, Force: true,
+	}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	got, err := embedcfg.Read(filepath.Join(dest, "client.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emb config.Config
+	if err := json.Unmarshal(got.ConfigJSON, &emb); err != nil {
+		t.Fatal(err)
+	}
+	if emb.Upload.Enabled {
+		t.Error("没有凭据时不应打开上传")
 	}
 }
 

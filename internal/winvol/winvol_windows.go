@@ -225,11 +225,57 @@ func fillVolumeInfo(v *Volume) {
 	v.SerialNumber = serial
 }
 
+// 门控拒绝码（写入审计，供事后复盘）。
+//
+// 两个阈值语义完全不同，不能用同一个码——`used_threshold` 管的是"这块盘值不值得动"，
+// `max_total_bytes` 管的是"这次要搬多少数据"。共用一个码会让复盘时
+// 分不清该调哪个配置项。
+const (
+	// PolicyCodeOK 表示通过门控。
+	PolicyCodeOK = "ok"
+	// PolicyCodeOverThreshold 表示已占用容量超过 used_threshold。
+	PolicyCodeOverThreshold = "used-over-threshold"
+	// PolicyCodeOverMaxTotal 表示待打包数据量超过 max_total_bytes。
+	PolicyCodeOverMaxTotal = "max-total-exceeded"
+	// PolicyCodeNotReady 表示卷未就绪或读数异常。
+	PolicyCodeNotReady = "volume-not-ready"
+)
+
+// humanBytesShort 把字节数写成便于人工阅读的 GiB/MiB 文本，用于门控理由。
+//
+// 不复用 fsutil.HumanBytes：这里是纯展示字符串，且 winvol 刻意不依赖 fsutil，
+// 免得为一个格式化函数把包依赖图搞复杂。精度到小数点后两位，够定位量级。
+func humanBytesShort(n int64) string {
+	if n < 0 {
+		return fmt.Sprintf("%d 字节", n)
+	}
+	const (
+		kib = 1 << 10
+		mib = 1 << 20
+		gib = 1 << 30
+		tib = 1 << 40
+	)
+	switch {
+	case n >= tib:
+		return fmt.Sprintf("%.2f TiB", float64(n)/tib)
+	case n >= gib:
+		return fmt.Sprintf("%.2f GiB", float64(n)/gib)
+	case n >= mib:
+		return fmt.Sprintf("%.2f MiB", float64(n)/mib)
+	case n >= kib:
+		return fmt.Sprintf("%.2f KiB", float64(n)/kib)
+	default:
+		return fmt.Sprintf("%d 字节", n)
+	}
+}
+
 // Policy 描述容量门控的判定结果（F-304）。
 type Policy struct {
 	// Proceed 为 true 表示允许对该卷执行整盘打包。
 	Proceed bool
-	// Reason 是人类可读的判定理由，写入日志与审计。
+	// Code 是稳定的机器可读拒绝码，写入审计。
+	Code string
+	// Reason 是人类可读的判定理由，写入日志与输出。
 	Reason string
 }
 
@@ -239,25 +285,33 @@ type Policy struct {
 // 任何数值异常都返回 Proceed=false（保守优先）。
 func EvaluateGate(v Volume, thresholdBytes, maxTotalBytes int64) Policy {
 	if !v.Ready {
-		return Policy{Proceed: false, Reason: "卷未就绪，保守跳过"}
+		return Policy{Code: PolicyCodeNotReady, Reason: "卷未就绪，保守跳过"}
 	}
 	if v.UsedBytes < 0 {
-		return Policy{Proceed: false, Reason: "已占用容量读数异常（负数），保守跳过"}
+		return Policy{Code: PolicyCodeNotReady, Reason: "已占用容量读数异常（负数），保守跳过"}
 	}
 	if v.TotalBytes <= 0 {
-		return Policy{Proceed: false, Reason: "总容量读数异常，保守跳过"}
+		return Policy{Code: PolicyCodeNotReady, Reason: "总容量读数异常，保守跳过"}
 	}
 	if v.UsedBytes > thresholdBytes {
-		return Policy{Proceed: false, Reason: fmt.Sprintf("已占用容量超过阈值，按配置跳过整盘打包")}
+		return Policy{
+			Code: PolicyCodeOverThreshold,
+			Reason: fmt.Sprintf("已占用容量 %s 超过阈值 %s，按配置跳过整盘打包",
+				humanBytesShort(v.UsedBytes), humanBytesShort(thresholdBytes)),
+		}
 	}
 	if maxTotalBytes > 0 && v.UsedBytes > maxTotalBytes {
 		// 比较对象是**待打包的数据量**（已占用容量），不是卷总容量。
 		//
 		// 若拿卷总容量来比，一块 64 GiB 的 U 盘哪怕只用了 500 MiB 也会被跳过，
 		// 等于把"打包体积上限"误变成"介质容量上限"，与意图完全相反。
-		return Policy{Proceed: false, Reason: "待打包数据量超过上限，按配置跳过整盘打包"}
+		return Policy{
+			Code: PolicyCodeOverMaxTotal,
+			Reason: fmt.Sprintf("待打包数据量 %s 超过上限 %s，按配置跳过整盘打包",
+				humanBytesShort(v.UsedBytes), humanBytesShort(maxTotalBytes)),
+		}
 	}
-	return Policy{Proceed: true, Reason: "已占用容量在阈值以内，执行整盘打包"}
+	return Policy{Proceed: true, Code: PolicyCodeOK, Reason: "已占用容量在阈值以内，执行整盘打包"}
 }
 
 // LabelOrFallback 返回卷标；卷标为空或净化后为空时返回 `VOL_<盘符>`

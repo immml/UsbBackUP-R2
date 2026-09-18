@@ -232,3 +232,27 @@ func TestGroupHexInKeystore(t *testing.T) {
 		t.Fatalf("分组格式错误: %q", got)
 	}
 }
+
+// KeyFileNeedsPassphrase 是命令行"下一步"提示的依据：错一次就会让人
+// 拿着注定失败的配置去跑 pull，所以三个分支都钉住。
+func TestKeyFileNeedsPassphrase(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1) 带口令的私钥 → true
+	enc := genForTest(t, filepath.Join(dir, "enc"), []byte("key-pass-123"))
+	if need, err := KeyFileNeedsPassphrase(enc.PrivatePath); err != nil || !need {
+		t.Fatalf("带口令私钥应判为需要口令，得到 need=%v err=%v", need, err)
+	}
+
+	// 2) 不带口令的私钥 → false
+	plain := genForTest(t, filepath.Join(dir, "plain"), nil)
+	if need, err := KeyFileNeedsPassphrase(plain.PrivatePath); err != nil || need {
+		t.Fatalf("无口令私钥不应判为需要口令，得到 need=%v err=%v", need, err)
+	}
+
+	// 3) 文件不存在 → (false, nil)，而不是报错：
+	//    调用方此时只是决定"要不要提示口令"，私钥是否有效由后续加载步骤负责报错。
+	if need, err := KeyFileNeedsPassphrase(filepath.Join(dir, "nope.pem")); err != nil || need {
+		t.Fatalf("缺失文件应返回 (false, nil)，得到 need=%v err=%v", need, err)
+	}
+}

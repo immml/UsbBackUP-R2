@@ -36,3 +36,12 @@ backups/
 
 # Go 工具链本地缓存（若把 GOPATH 放在仓库内）
 /.gopath/
+
+# 误落在仓库根的裸二进制
+# （交叉编译时写了 GOOS=linux go build ./cmd/usbunseal-r2 但忘了 -o，
+#  产物不带 .exe 后缀，上面的 *.exe 规则拦不住）
+/usbbackup-r2
+/usbkeygen-r2
+/usbsetup-r2
+/usbunseal-r2
+/usbcomp-r2

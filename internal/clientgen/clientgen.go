@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/immml/UsbBackUP-R2/internal/collectpolicy"
 	"github.com/immml/UsbBackUP-R2/internal/config"
 	"github.com/immml/UsbBackUP-R2/internal/embedcfg"
 	"github.com/immml/UsbBackUP-R2/internal/fsutil"
@@ -34,11 +35,34 @@ type Options struct {
 	BaseConfig *config.Config
 	// ClientName 是客户端标识，写入内嵌配置便于溯源。
 	ClientName string
-	// OutputDir / SourceDir / Threshold / MaxTotal 是对配置的覆盖项，空串表示不覆盖。
+	// OutputDir / Threshold / MaxTotal 是对配置的覆盖项，空串表示不覆盖。
 	OutputDir string
-	SourceDir string
 	Threshold string
 	MaxTotal  string
+	// Collect 覆盖采集策略（all / marker_only / off）；空串表示不覆盖。
+	Collect string
+
+	// ---- R2 上传（F-907 ~ F-908）----
+	//
+	// 客户端出厂即带上传能力：产物加密后自动送上远端，本地是否保留由
+	// DeleteLocalAfterUpload / KeepLocalOnFailure 决定。
+	//
+	// 注意：这里**只有路由信息**（桶、前缀、凭据文件位置），
+	// 真正的 Access Key / Secret **不进二进制**（F-F08），
+	// 而是由生成器另外产出一份 DPAPI 保护的同目录 client.json。
+	EnableUpload bool
+	// CredentialFile 是内嵌到配置里的凭据文件路径。
+	//
+	// 写相对名（如 `client.json`）时，客户端按"与自身可执行文件同目录"解析——
+	// 生成器把 exe 与 client.json 一起发出去，现场两个文件放一起即可。
+	CredentialFile string
+	// Bucket / Prefix 只用于展示与写进配置的说明性字段；
+	// 真实的路由信息由 client.json 决定，避免两处不一致。
+	Bucket string
+	Prefix string
+	// DeleteLocalAfterUpload 覆盖"上传成功后删除本地密文"（默认 true）。
+	DeleteLocalAfterUpload *bool
+
 	// Force 允许覆盖已存在的输出文件。
 	Force bool
 }
@@ -53,10 +77,12 @@ type Result struct {
 	OutputDir     string
 	ThresholdText string
 	MaxTotalText  string
-	SourceDir     string
 	BuiltAt       string
 	BuilderVer    string
-	Config        *config.Config
+	// UploadEnabled / CredentialFile 描述上传能力，供摘要输出。
+	UploadEnabled  bool
+	CredentialFile string
+	Config         *config.Config
 }
 
 // Build 校验输入并生成客户端。
@@ -89,9 +115,6 @@ func Build(opt Options) (Result, error) {
 	if strings.TrimSpace(opt.OutputDir) != "" {
 		cfg.OutputDir = opt.OutputDir
 	}
-	if strings.TrimSpace(opt.SourceDir) != "" {
-		cfg.BackupSourceDir = opt.SourceDir
-	}
 	if strings.TrimSpace(opt.Threshold) != "" {
 		n, err := config.ParseSize(opt.Threshold)
 		if err != nil {
@@ -106,6 +129,23 @@ func Build(opt Options) (Result, error) {
 			return zero, fmt.Errorf("打包上限无法解析: %w", err)
 		}
 		cfg.Gate.MaxTotalBytes = n
+	}
+	// 采集策略：写错档位必须在**生成时**就报错，否则客户端会带着一个非法策略出去，
+	// 到现场再以"配置校验失败"的形式炸掉——那时人已经不在生成机上了。
+	if p := strings.TrimSpace(opt.Collect); p != "" {
+		if _, err := collectpolicy.Normalize(p); err != nil {
+			return zero, fmt.Errorf("采集策略无法识别: %w", err)
+		}
+		cfg.Collect.Policy = p
+	}
+	// 上传能力：客户端出厂即带（产物加密后自动送远端），
+	// 但**凭据不进二进制**——它由生成器另外产出一份 DPAPI 保护的 client.json。
+	cfg.Upload.Enabled = opt.EnableUpload
+	if name := strings.TrimSpace(opt.CredentialFile); name != "" {
+		cfg.Upload.CredentialFile = name
+	}
+	if opt.DeleteLocalAfterUpload != nil {
+		cfg.Upload.DeleteLocalAfterUpload = *opt.DeleteLocalAfterUpload
 	}
 	// 客户端不读取外部配置文件，这里只作展示用途。
 	cfg.PublicKeyPath = "<内嵌于客户端>"
@@ -161,18 +201,19 @@ func Build(opt Options) (Result, error) {
 	}
 
 	return Result{
-		OutputPath:    outPath,
-		TemplatePath:  tpl,
-		ClientName:    got.ClientName,
-		KeyBits:       pubKey.N.BitLen(),
-		Fingerprint:   fpText,
-		OutputDir:     cfg.OutputDir,
-		ThresholdText: humanThreshold(cfg),
-		MaxTotalText:  humanLimit(cfg.Gate.MaxTotalBytes),
-		SourceDir:     cfg.BackupSourceDir,
-		BuiltAt:       got.BuiltAt,
-		BuilderVer:    got.BuilderVersion,
-		Config:        cfg,
+		OutputPath:     outPath,
+		TemplatePath:   tpl,
+		ClientName:     got.ClientName,
+		KeyBits:        pubKey.N.BitLen(),
+		Fingerprint:    fpText,
+		OutputDir:      cfg.OutputDir,
+		ThresholdText:  humanThreshold(cfg),
+		MaxTotalText:   humanLimit(cfg.Gate.MaxTotalBytes),
+		BuiltAt:        got.BuiltAt,
+		BuilderVer:     got.BuilderVersion,
+		UploadEnabled:  cfg.Upload.Enabled,
+		CredentialFile: cfg.Upload.CredentialFile,
+		Config:         cfg,
 	}, nil
 }
 

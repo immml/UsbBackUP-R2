@@ -82,6 +82,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdInspect(rest, stdout, stderr)
 	case "selftest":
 		return cmdSelfTest(rest, stdout, stderr)
+	case "cred":
+		return cmdCred(rest, stdin, stdout, stderr)
+	case "r2-check":
+		return cmdR2Check(rest, stdout, stderr)
 	case "build-client":
 		return cmdBuildClient(rest, stdout, stderr)
 	case "install-usb":
@@ -94,13 +98,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 func printUsage(w io.Writer) {
-	cli.PrintHelp(w, "usbkeygen-r2 —— usbbackup-r2 密钥生成器", []string{
+	cli.PrintHelp(w, "usbkeygen-r2 —— usbbackup-r2 密钥与凭据生成器", []string{
 		"用法：",
 		"  usbkeygen-r2 generate [选项]          生成新的 RSA 密钥对",
 		"  usbkeygen-r2 use <公钥文件>            选择已有公钥并登记到配置",
 		"  usbkeygen-r2 inspect <公钥文件>        查看公钥位数与指纹",
 		"  usbkeygen-r2 selftest                 就地校验混合加密往返（不落盘）",
-		"  usbkeygen-r2 build-client             产出内嵌配置与公钥的客户端 exe",
+		"  usbkeygen-r2 cred [选项]              生成受 DPAPI 保护的 R2 凭据 client.json",
+		"  usbkeygen-r2 r2-check [选项]          用凭据做一次探活（写一个临时对象再删掉）",
+		"  usbkeygen-r2 build-client [选项]      产出内嵌配置与公钥的客户端 exe",
 		"  usbkeygen-r2 install-usb --drive E:    组装一个便携工具 U 盘",
 		"  usbkeygen-r2 version                  显示版本信息",
 		"",
@@ -115,15 +121,34 @@ func printUsage(w io.Writer) {
 		"  --pass             交互式设置私钥口令（无回显）",
 		"  --pass-file string 从文件读取口令（首行）",
 		"",
+		"cred 选项：",
+		"  --out string       输出路径（默认 .\\client.json）",
+		"  --from string      从 JSON 文件读取全部字段（account_id/bucket/…）",
+		"  --account-id string  Cloudflare 账户 ID",
+		"  --bucket string     目标桶名",
+		"  --endpoint string   S3 端点（留空按 account-id 推导）",
+		"  --prefix string     对象键前缀（默认 usb/）",
+		"  --access-key-id string    Access Key ID",
+		"  --secret-file string      从文件读 Secret Access Key（首行）",
+		"  --secret-access-key string 直接传 Secret（不安全，会留在命令行历史里）",
+		"  --session-token string     临时凭据的 Session Token（可选）",
+		"  --label / --scope / --force",
+		"",
+		"r2-check 选项：",
+		"  --cred-file string  凭据文件路径（默认 .\\client.json）",
+		"  --timeout int       单次请求总超时分钟数（默认 2）",
+		"  --keep-probe        保留探活对象（默认写完立刻删除）",
+		"",
 		"install-usb 选项：",
 		"  --drive E:          目标 U 盘盘符（必填，必须是可移动磁盘）",
 		"  --subdir DIR        工具放在盘内的子目录（如 backup\\tools，默认盘根）",
-		"                      授权标记 .usbbackup-r2-allow 始终写盘根，不受此项影响",
+		"                      授权标记 .usbbackup-allow 始终写盘根，不受此项影响",
 		"  --public string     公钥路径（默认同目录 keys/usbbackup-r2.pub.pem）",
 		"  --private string    私钥路径（默认同目录 keys/usbbackup-r2.key.pem）",
 		"  --keys DIR          密钥目录（可代替上面两项）",
 		"  --without-private   不把私钥写进 U 盘",
 		"  --no-client         不生成/复制 client.exe",
+		"  --cred string       一并放进盘内的 client.json（可选）",
 		"  --force             覆盖已存在的同名文件",
 		"",
 		"build-client 选项：",
@@ -132,9 +157,12 @@ func printUsage(w io.Writer) {
 		"  --template string  客户端模板 exe（默认同目录 usbbackup-r2.exe）",
 		"  --config string    基础配置文件（可选）",
 		"  --output-dir DIR   覆盖产物输出目录（支持 %TEMP%）",
-		"  --source-dir DIR   覆盖分支 A 的本地备份源目录",
 		"  --threshold SIZE   覆盖容量门控阈值（如 10GiB / 10GB）",
 		"  --max-total SIZE   覆盖打包体积上限（0 或 unlimited 表示不限制）",
+		"  --collect POLICY   采集策略：all / marker_only / off",
+		"  --upload           开启上传到 R2（默认关闭；需配合 client.json 使用）",
+		"  --no-upload        关闭上传（覆盖基础配置里的取值）",
+		"  --cred-name string 写入配置的凭据文件名（默认 client.json）",
 		"  --name string      客户端标识",
 		"  --force            覆盖已存在的输出文件",
 		"",
@@ -142,6 +170,7 @@ func printUsage(w io.Writer) {
 		"  --config string    配置文件路径（默认 %LOCALAPPDATA%\\usbbackup-r2\\config.json）",
 		"",
 		"安全提示：generate 成功后请立即离线备份私钥与口令。私钥丢失则密文不可恢复。",
+		"          凭据与机器绑定：换机器需重新执行 cred 生成，不需要重新编译客户端。",
 	})
 }
 

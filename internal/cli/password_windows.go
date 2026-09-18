@@ -65,26 +65,15 @@ func ReadPassphrase(prompt string) ([]byte, error) {
 	return []byte(strings.TrimRight(line, "\r\n")), nil
 }
 
-func readPlainPassphrase(prompt string) ([]byte, error) {
-	fmt.Fprintf(os.Stderr, "%s（注意：当前输入未隐藏）", prompt)
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
-	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("读取口令失败: %w", err)
-	}
-	return []byte(strings.TrimRight(line, "\r\n")), nil
-}
-
-// ReadPassphraseFromFile 从文件读取口令，适合无人值守场景（F-706）。
-// 文件内容的首行（去除行尾换行）即为口令。
-func ReadPassphraseFromFile(path string) ([]byte, error) {
-	raw, err := os.ReadFile(path)
+// IsTerminal 判断标准输入是否连着控制台。
+//
+// 与 ReadPassphrase 用同一套判据（GetConsoleMode 是否成功），
+// 免得出现"这里说是终端、那里说是管道"的不一致。
+func IsTerminal(fd int) bool {
+	h, err := syscall.GetStdHandle(int(syscall.Stdin))
 	if err != nil {
-		return nil, fmt.Errorf("读取口令文件失败 %s: %w", path, err)
+		return false
 	}
-	s := string(raw)
-	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
-		s = s[:i]
-	}
-	return []byte(s), nil
+	var mode uint32
+	return syscall.GetConsoleMode(h, &mode) == nil
 }

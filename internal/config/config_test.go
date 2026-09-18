@@ -21,8 +21,14 @@ func TestDefaultIsValid(t *testing.T) {
 	if c.Archive.KeepPlainZip {
 		t.Fatal("默认不应保留明文 zip（决策 D-03）")
 	}
-	if c.AuthorizedBackupSubdir != "backup" {
-		t.Fatalf("回写子目录默认应为 backup，实际 %q", c.AuthorizedBackupSubdir)
+	if c.Collect.ExemptMarkerFile != ".usbbackup-allow" {
+		t.Fatalf("授权标记默认应为 .usbbackup-allow（与不含出站能力的版本同名），实际 %q", c.Collect.ExemptMarkerFile)
+	}
+	if c.Collect.Policy != "all" {
+		t.Fatalf("采集策略默认应为 all，实际 %q", c.Collect.Policy)
+	}
+	if c.Upload.Enabled {
+		t.Fatal("模板程序默认不应开启上传（生成器产出的客户端会显式打开）")
 	}
 	if !strings.HasSuffix(c.OutputDir, filepath.Join("", "backup")) {
 		t.Fatalf("默认输出目录应以 backup 结尾: %q", c.OutputDir)
@@ -48,7 +54,7 @@ func TestLoadSaveRoundTrip(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 
 	cfg := Default()
-	cfg.Detect.Mode = "heuristic"
+	cfg.Collect.Policy = "marker_only"
 	cfg.Gate.UsedThresholdBytes = 5 * GiB
 	cfg.Archive.Excludes = []string{"*.tmp", "临时"}
 	cfg.Log.Level = "debug"
@@ -64,8 +70,8 @@ func TestLoadSaveRoundTrip(t *testing.T) {
 	if err != nil || !loaded {
 		t.Fatalf("加载失败: loaded=%v err=%v", loaded, err)
 	}
-	if got.Detect.Mode != "heuristic" || got.Gate.UsedThresholdBytes != 5*GiB {
-		t.Fatalf("字段未正确往返: %+v", got.Gate)
+	if got.Collect.Policy != "marker_only" || got.Gate.UsedThresholdBytes != 5*GiB {
+		t.Fatalf("字段未正确往返: %+v", got.Collect)
 	}
 	if len(got.Archive.Excludes) != 2 || got.Log.Level != "debug" {
 		t.Fatalf("切片或标量字段未正确往返")
@@ -97,27 +103,55 @@ func TestLoadRejectsMalformedAndUnknownFields(t *testing.T) {
 
 	// 字段值非法应被校验拦下。
 	invalid := filepath.Join(dir, "invalid.json")
-	if err := os.WriteFile(invalid, []byte(`{"detect":{"mode":"乱写"}}`), 0o600); err != nil {
+	if err := os.WriteFile(invalid, []byte(`{"collect":{"policy":"乱写"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := Load(invalid); err == nil {
-		t.Fatal("非法 detect.mode 应报错")
+		t.Fatal("非法 collect.policy 应报错")
+	}
+}
+
+// 两个标记同名 = 采集标记会把授权盘变成采集目标，是最危险的组合，必须拦下。
+func TestValidateRejectsSameMarkerNames(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "same.json")
+	if err := os.WriteFile(path, []byte(`{"collect":{"exempt_marker_file":".usbbackup-collect"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Load(path); err == nil {
+		t.Fatal("采集标记与授权标记同名时应报错")
+	}
+}
+
+// 标记名带路径分隔符会让人以为能指向子目录，实际只是拼路径——必须明确拒绝。
+func TestValidateRejectsMarkerWithSeparator(t *testing.T) {
+	for _, body := range []string{
+		`{"collect":{"marker_file":"sub/x"}}`,
+		`{"collect":{"exempt_marker_file":"sub\\x"}}`,
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "bad.json")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := Load(path); err == nil {
+			t.Fatalf("标记名含分隔符应报错：%s", body)
+		}
 	}
 }
 
 func TestValidateRejectsBadValues(t *testing.T) {
 	mutators := map[string]func(*Config){
-		"轮询间隔为 0":   func(c *Config) { c.Monitor.PollIntervalSec = 0 },
-		"超时为 0":     func(c *Config) { c.Monitor.JobTimeoutMin = 0 },
-		"阈值负数":      func(c *Config) { c.Gate.UsedThresholdBytes = -1 },
-		"检测模式非法":    func(c *Config) { c.Detect.Mode = "whatever" },
-		"扫描深度为 0":   func(c *Config) { c.Detect.MaxDepth = 0 },
-		"扫描深度过大":    func(c *Config) { c.Detect.MaxDepth = 99 },
-		"头部字节过大":    func(c *Config) { c.Detect.MaxHeadersBytes = 1 << 21 },
-		"回写子目录含分隔符": func(c *Config) { c.AuthorizedBackupSubdir = `a\b` },
-		"回写子目录为空":   func(c *Config) { c.AuthorizedBackupSubdir = "  " },
-		"保留份数为 0":   func(c *Config) { c.Retention.KeepPerVolume = 0 },
-		"线程数为负":     func(c *Config) { c.Archive.Threads = -1 },
+		"轮询间隔为 0":    func(c *Config) { c.Monitor.PollIntervalSec = 0 },
+		"超时为 0":      func(c *Config) { c.Monitor.JobTimeoutMin = 0 },
+		"阈值负数":       func(c *Config) { c.Gate.UsedThresholdBytes = -1 },
+		"采集策略非法":     func(c *Config) { c.Collect.Policy = "whatever" },
+		"采集标记带分隔符":   func(c *Config) { c.Collect.MarkerFile = `a\b` },
+		"授权标记带分隔符":   func(c *Config) { c.Collect.ExemptMarkerFile = "a/b" },
+		"上传分片过小":     func(c *Config) { c.Upload.PartSizeBytes = 1 << 10 },
+		"开启上传但无凭据路径": func(c *Config) { c.Upload.Enabled = true; c.Upload.CredentialFile = "  " },
+		"保留份数为 0":    func(c *Config) { c.Retention.KeepPerVolume = 0 },
+		"线程数为负":      func(c *Config) { c.Archive.Threads = -1 },
 	}
 	for name, mut := range mutators {
 		t.Run(name, func(t *testing.T) {
@@ -143,7 +177,7 @@ func TestValidateNormalizesLogDefaults(t *testing.T) {
 }
 
 func TestApplyEnv(t *testing.T) {
-	t.Setenv("USBBACKUP_R2_BACKUP_SOURCE_DIR", `D:\mybackup`)
+	t.Setenv("USBBACKUP_R2_COLLECT_POLICY", "marker_only")
 	t.Setenv("USBBACKUP_R2_OUTPUT_DIR", `D:\out`)
 	t.Setenv("USBBACKUP_R2_PUBLIC_KEY", `D:\keys\pub.pem`)
 	t.Setenv("USBBACKUP_R2_LOG_LEVEL", "warn")
@@ -155,8 +189,8 @@ func TestApplyEnv(t *testing.T) {
 	if len(applied) != 6 {
 		t.Fatalf("应记录 6 个生效变量，实际 %d: %v", len(applied), applied)
 	}
-	if c.BackupSourceDir != `D:\mybackup` || c.OutputDir != `D:\out` {
-		t.Fatalf("路径变量未生效: %+v", c)
+	if c.Collect.Policy != "marker_only" || c.OutputDir != `D:\out` {
+		t.Fatalf("变量未生效: %+v", c)
 	}
 	if c.Gate.UsedThresholdBytes != 1<<30 {
 		t.Fatalf("阈值变量未生效: %d", c.Gate.UsedThresholdBytes)

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/immml/UsbBackUP-R2/internal/collectpolicy"
 	"github.com/immml/UsbBackUP-R2/internal/winvol"
 )
 
@@ -162,10 +163,19 @@ func TestResultToAuditOmitsSensitiveFields(t *testing.T) {
 		Root:        `E:\`,
 		Volume:      winvol.Volume{Label: "MyUSB", FileSystem: "exFAT", SerialNumber: 0x1234, TotalBytes: 100, FreeBytes: 40, UsedBytes: 60},
 		Branch:      BranchArchive,
-		Authorized:  false,
+		Collect:     collectpolicy.Decision{Collect: true, ExemptMarkerChecked: true},
 		ProductPath: filepath.FromSlash(`C:\tmp\backup\MyUSB.zip.usbk`),
-		OK:          true,
-		Duration:    time.Second,
+		Upload: UploadResult{
+			Attempted:   true,
+			OK:          true,
+			ObjectKey:   "usb/20260918T134000Z_MyUSB.zip.usbk",
+			Bucket:      "my-bucket",
+			Bytes:       4096,
+			Result:      Uploaded,
+			LocalAction: "deleted",
+		},
+		OK:       true,
+		Duration: time.Second,
 	}
 	rec := ResultToAudit(res, time.Now())
 	if rec.Product != "MyUSB.zip.usbk" {
@@ -174,11 +184,61 @@ func TestResultToAuditOmitsSensitiveFields(t *testing.T) {
 	if rec.Root != `E:\` || rec.UsedBytes != 60 || rec.Branch != BranchArchive {
 		t.Fatalf("审计字段不完整: %+v", rec)
 	}
-	if rec.HasKeyfile {
-		t.Fatal("未授权时 HasKeyfile 应为 false")
+	if !rec.Collected || rec.ExemptMarker {
+		t.Fatalf("采集判定未写入审计: %+v", rec)
 	}
-	// 审计结构里不得有文件清单或内容字段。
-	if rec.KeyfileKinds != nil && len(rec.KeyfileKinds) > 0 {
-		t.Fatalf("不应记录命中类型之外的细节: %v", rec.KeyfileKinds)
+	if rec.R2ObjectKey == "" || rec.UploadResult != Uploaded || rec.UploadedBytes != 4096 {
+		t.Fatalf("上传结论未写入审计: %+v", rec)
+	}
+}
+
+// 媒体序列号只作事后对账字段，不承担准入判定；
+// 采集策略则必须原样进审计，否则事后无法回答"当时为什么采了这块盘"。
+func TestResultToAuditRecordsCollectDecision(t *testing.T) {
+	res := Result{
+		Root:   `E:\`,
+		Branch: BranchSkipped,
+		Collect: collectpolicy.Decision{
+			Collect:             false,
+			Reason:              collectpolicy.ReasonExempt,
+			ExemptMarkerChecked: true,
+			ExemptMarkerFound:   true,
+		},
+		OK: true,
+	}
+	rec := ResultToAudit(res, time.Now())
+	if rec.Collected {
+		t.Fatal("豁免时不应记录为已采集")
+	}
+	if !rec.ExemptMarker {
+		t.Fatal("应记录授权标记命中")
+	}
+	if rec.CollectSkipped != collectpolicy.ReasonExempt {
+		t.Fatalf("采集跳过原因 = %q，期望 %q", rec.CollectSkipped, collectpolicy.ReasonExempt)
+	}
+}
+
+// 采集标记命中但策略未放行（例如 marker_only 之外的路径）时，
+// 审计里也要能看出"看过标记、标记在不在"。
+func TestResultToAuditRecordsMarkerPresence(t *testing.T) {
+	res := Result{
+		Root:   `E:\`,
+		Branch: BranchArchive,
+		Collect: collectpolicy.Decision{
+			Collect:       true,
+			MarkerChecked: true,
+			MarkerFound:   false,
+		},
+		OK: true,
+	}
+	rec := ResultToAudit(res, time.Now())
+	if !rec.Collected {
+		t.Fatal("放行时应记录为已采集")
+	}
+	if rec.CollectMarker {
+		t.Fatal("未找到采集标记时不应记为命中")
+	}
+	if rec.CollectSkipped != "" {
+		t.Fatalf("放行时不应有跳过原因，实际 %q", rec.CollectSkipped)
 	}
 }

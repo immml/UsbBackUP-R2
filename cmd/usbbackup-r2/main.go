@@ -1,4 +1,4 @@
-// Command usbbackup-r2 是常驻主程序。
+// Command usbbackup-r2 是常驻主程序（也用作生成器的客户端模板）。
 //
 // 用法：
 //
@@ -6,11 +6,13 @@
 //	usbbackup-r2 once --drive E: [--allow-fixed] [--dry-run]
 //	usbbackup-r2 list [--all]
 //	usbbackup-r2 probe --drive E:
+//	usbbackup-r2 upload <产物.usbk> [--key <对象键>] [--keep]
+//	usbbackup-r2 cred-check
 //	usbbackup-r2 config-check
 //	usbbackup-r2 install-service / uninstall-service / start / stop / status
 //	usbbackup-r2 version
 //
-// 对应需求 F-101 ~ F-107、F-801 ~ F-809、F-D01 ~ F-D03。
+// 对应需求 F-101 ~ F-107、F-801 ~ F-809、F-H01 ~ F-H04、F-D01 ~ F-D03。
 package main
 
 import (
@@ -22,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -29,9 +32,9 @@ import (
 	"github.com/immml/UsbBackUP-R2/internal/agreement"
 	"github.com/immml/UsbBackUP-R2/internal/backup"
 	"github.com/immml/UsbBackUP-R2/internal/cli"
+	"github.com/immml/UsbBackUP-R2/internal/collectpolicy"
 	"github.com/immml/UsbBackUP-R2/internal/config"
 	"github.com/immml/UsbBackUP-R2/internal/fsutil"
-	"github.com/immml/UsbBackUP-R2/internal/keyfile"
 	"github.com/immml/UsbBackUP-R2/internal/keystore"
 	"github.com/immml/UsbBackUP-R2/internal/logx"
 	"github.com/immml/UsbBackUP-R2/internal/version"
@@ -101,6 +104,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdList(rest, stdout, stderr)
 	case "probe":
 		return cmdProbe(rest, cfgPath, stdout, stderr)
+	case "upload":
+		return cmdUpload(rest, cfgPath, stdout, stderr)
+	case "cred-check":
+		return cmdCredCheck(cfgPath, stdout, stderr)
 	case "config-check":
 		return cmdConfigCheck(cfgPath, stdout, stderr)
 	case "install-service", "uninstall-service", "start", "stop", "status":
@@ -113,12 +120,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 func printUsage(w io.Writer) {
-	cli.PrintHelp(w, "usbbackup-r2 —— Windows 专用 U 盘自动备份与加密工具", []string{
+	cli.PrintHelp(w, "usbbackup-r2 —— Windows 专用 U 盘自动备份与加密上传工具", []string{
 		"用法：",
 		"  usbbackup-r2 run [选项]                    前台常驻运行（监控 U 盘插入）",
 		"  usbbackup-r2 once --drive E: [选项]        对指定盘符执行一次作业",
 		"  usbbackup-r2 list [--all]                  列出可移动卷及其容量",
-		"  usbbackup-r2 probe --drive E:              只读诊断（不写任何数据）",
+		"  usbbackup-r2 probe --drive E:              只读诊断（不写数据、不发请求）",
+		"  usbbackup-r2 upload <产物.usbk>            手工补传一个本地密文产物到 R2",
+		"  usbbackup-r2 cred-check                    检查凭据文件能否在本机解开",
 		"  usbbackup-r2 config-check                  校验配置与运行环境",
 		"  usbbackup-r2 install-service               注册为 Windows 服务（需管理员）",
 		"  usbbackup-r2 uninstall-service             删除服务（需管理员）",
@@ -137,36 +146,36 @@ func printUsage(w io.Writer) {
 		"  --yes             跳过免责声明确认（自动化用）",
 		"",
 		"run / once 选项：",
-		"  --dry-run         只做检测与门控判定，不写入任何数据",
+		"  --dry-run         只做准入与门控判定，不写入数据、不发起网络请求",
 		"  --poll-only       强制仅使用轮询（排障用；默认事件驱动）",
 		"  --allow-fixed     允许对固定磁盘执行作业",
 		"                    【仅供验证与排障】生产环境不要开启",
-		"  --overwrite       回写时覆盖目标同名文件（默认跳过）",
-		"  --verify-hash     回写后按 SHA-256 逐文件校验",
 		"  --service         以 Windows 服务方式运行（由 SCM 调用）",
 		"  --simulate-arrival E:",
 		"                    注入一次模拟的卷到达事件（仅用于验证链路，可重复）",
 		"",
-		"行为概述：",
-		"  检测到介质持有私钥 → 把本地备份文件夹内容复制到该介质 \\backup\\ 目录；",
-		"  未检测到私钥       → 已占用容量 ≤ 阈值则整盘打包并混合加密到 %TEMP%\\backup\\，",
-		"                       超过阈值则直接跳过。",
-		"  两个分支都不会删除或改写源介质上的任何文件。",
+		"upload 选项：",
+		"  --key string      指定远端对象键（默认 {前缀}{UTC时间戳}_{文件名}）",
+		"  --keep            上传成功后保留本地产物",
 		"",
-		"提示：首次使用请先跑 `usbbackup-r2 probe --drive <盘符>` 确认判定结果符合预期。",
+		"行为概述：",
+		"  盘根有授权标记 .usbbackup-allow → **豁免**，不读取不打包不上传；",
+		"  否则按采集策略（all / marker_only / off）决定是否采集；",
+		"  采集 + 已占用容量 ≤ 阈值 → 整盘打包、混合加密，并按配置上传到 R2；",
+		"  全程对源介质只读，不删除或改写源盘上的任何文件。",
+		"",
+		"提示：首次使用请先跑 `usbbackup-r2 probe --drive <盘符>` 确认判定符合预期。",
 	})
 }
 
 // ---- 运行参数 ----
 
 type runFlags struct {
-	drive     string
-	dryRun    bool
-	pollOnly  bool
-	allowFix  bool
-	overwrite bool
-	verifyHsh bool
-	service   bool
+	drive    string
+	dryRun   bool
+	pollOnly bool
+	allowFix bool
+	service  bool
 	// simArrival 是验证辅助开关：在没有物理介质时注入一次"卷到达"事件，
 	// 用来跑通"监控 → 作业队列 → 流水线"的完整链路。生产不要使用。
 	simArrival stringList
@@ -191,8 +200,6 @@ func parseRunFlags(args []string, wantDrive bool, stderr io.Writer) (runFlags, s
 	fs.BoolVar(&rf.dryRun, "dry-run", false, "不写入任何数据")
 	fs.BoolVar(&rf.pollOnly, "poll-only", false, "仅使用轮询")
 	fs.BoolVar(&rf.allowFix, "allow-fixed", false, "允许对固定磁盘执行（仅供验证）")
-	fs.BoolVar(&rf.overwrite, "overwrite", false, "覆盖同名文件")
-	fs.BoolVar(&rf.verifyHsh, "verify-hash", false, "复制后按 SHA-256 校验")
 	fs.BoolVar(&rf.service, "service", false, "以 Windows 服务方式运行")
 	fs.Var(&rf.simArrival, "simulate-arrival", "注入一次模拟的卷到达事件（验证用，可重复）")
 	if err := cli.ParseArgs(fs, args); err != nil {
@@ -201,37 +208,23 @@ func parseRunFlags(args []string, wantDrive bool, stderr io.Writer) (runFlags, s
 	return rf, "", cli.ExitOK
 }
 
-// buildDeps 组装流水线依赖：配置、日志、判定器、公钥指纹。
-func buildDeps(cfg *config.Config, logger *slog.Logger, rf runFlags) (backup.Deps, error) {
-	var fp string
-	if clientBuild.ok && clientBuild.pub != nil {
-		// 客户端模式：指纹由内嵌公钥算出，与配置里的路径无关。
-		if _, got, err := keystore.PublicKeyFingerprint(clientBuild.pub); err == nil {
-			fp = got
-		}
-	} else if cfg.PublicKeyPath != "" {
-		if got, err := loadPubFingerprint(cfg.PublicKeyPath); err == nil {
-			fp = got
-		}
-	}
-	m, err := keyfile.NewMatcher(cfg.Detect.ExtraNamePatterns, cfg.Detect.ExtraContentMarkers, cfg.Detect.MaxHeadersBytes)
-	if err != nil {
-		return backup.Deps{}, fmt.Errorf("构造私钥判定器失败: %w", err)
-	}
+// buildDeps 组装流水线依赖：配置、日志、内嵌公钥。
+//
+// 这里没有"私钥判定器"这类东西了：采集准入完全由授权标记 + 采集策略决定，
+// 不再扫描介质内容（见 internal/collectpolicy 的包注释）。
+func buildDeps(cfg *config.Config, logger *slog.Logger, rf runFlags) backup.Deps {
 	deps := backup.Deps{
-		Cfg:                cfg,
-		Log:                logger,
-		Matcher:            m,
-		AllowedFingerprint: fp,
-		AllowFixed:         rf.allowFix,
-		DryRun:             rf.dryRun,
-		CopyOverwrite:      rf.overwrite,
-		CopyVerifyHash:     rf.verifyHsh,
+		Cfg:            cfg,
+		Log:            logger,
+		AllowFixed:     rf.allowFix,
+		DryRun:         rf.dryRun,
+		UploadPrefix:   "",
+		CredentialPath: "",
 	}
 	if clientBuild.ok {
 		deps.EmbeddedPublicKey = clientBuild.pub
 	}
-	return deps, nil
+	return deps
 }
 
 // ---- run ----
@@ -311,10 +304,9 @@ func serve(ctx context.Context, cfg *config.Config, logger *slog.Logger, rf runF
 		logger.Info("已清理上次遗留的半成品", "count", n)
 	}
 
-	deps, err := buildDeps(cfg, logger, rf)
-	if err != nil {
-		return err
-	}
+	deps := buildDeps(cfg, logger, rf)
+	// F-F06：上传通道的可用性必须在启动时就讲清楚，不允许静默降级。
+	reportUploadChannel(cfg, logger)
 
 	// 作业串行队列（F-104）：同一时刻只处理一个介质，避免 IO 抖动。
 	type job struct {
@@ -431,11 +423,14 @@ func cmdOnce(args []string, cfgPath string, stdout, stderr io.Writer) int {
 	}
 	defer logHandle.Close()
 
-	deps, err := buildDeps(cfg, logHandle.Logger, rf)
-	if err != nil {
-		fmt.Fprintf(stderr, "错误：%v\n", err)
-		return cli.ExitRuntime
+	if clientBuild.ok {
+		for _, line := range clientInfoLines() {
+			fmt.Fprintf(stdout, "%s\n", line)
+		}
 	}
+	reportUploadChannel(cfg, logHandle.Logger)
+
+	deps := buildDeps(cfg, logHandle.Logger, rf)
 	if rf.dryRun {
 		fmt.Fprintln(stdout, "[dry-run] 不会写入任何数据。")
 	}
@@ -454,22 +449,12 @@ func cmdOnce(args []string, cfgPath string, stdout, stderr io.Writer) int {
 		winvol.LabelOrFallback(res.Volume), emptyDash(res.Volume.FileSystem))
 	fmt.Fprintf(stdout, "已占用 / 阈值   : %s / %s\n",
 		fsutil.HumanBytes(res.Volume.UsedBytes), fsutil.HumanBytes(cfg.Gate.UsedThresholdBytes))
-	fmt.Fprintf(stdout, "私钥存在性      : %v（命中 %d 次，类型 %v）\n",
-		res.Authorized, res.Detect.HitCount, res.Detect.Kinds)
+	fmt.Fprintf(stdout, "授权标记        : %s\n", yesNoText(res.Collect.ExemptMarkerFound,
+		"命中（本盘豁免，不会被读取或上传）", "未命中"))
+	fmt.Fprintf(stdout, "采集判定        : %s\n", collectDecisionText(res.Collect))
 	fmt.Fprintf(stdout, "分支            : %s\n", res.Branch)
 	if res.SkipReason != "" {
 		fmt.Fprintf(stdout, "跳过原因        : %s\n", res.SkipReason)
-	}
-	if res.Copy != nil {
-		fmt.Fprintf(stdout, "回写            : 复制 %d / 跳过 %d / 失败 %d，共 %s\n",
-			res.Copy.FilesCopied, res.Copy.FilesSkipped, res.Copy.FilesFailed,
-			fsutil.HumanBytes(res.Copy.BytesCopied))
-		if res.Copy.ManifestWritten {
-			fmt.Fprintln(stdout, "                  已写出回写清单 .usbbackup-r2-manifest.json")
-		}
-		if res.Copy.VerifyFailures > 0 {
-			fmt.Fprintf(stdout, "                  校验不一致 %d 个文件\n", res.Copy.VerifyFailures)
-		}
 	}
 	if res.ProductPath != "" {
 		fmt.Fprintf(stdout, "产物            : %s\n", res.ProductPath)
@@ -478,13 +463,76 @@ func cmdOnce(args []string, cfgPath string, stdout, stderr io.Writer) int {
 			fsutil.HumanBytes(res.Encrypt.PlainBytes), fsutil.HumanBytes(res.Encrypt.CipherBytes))
 		fmt.Fprintf(stdout, "公钥指纹        : %s\n", res.Encrypt.Header.FingerprintHex())
 	}
+	if res.Upload.Result != "" {
+		fmt.Fprintf(stdout, "上传            : %s\n", uploadText(res.Upload))
+		if res.Upload.ObjectKey != "" {
+			fmt.Fprintf(stdout, "  远端对象      : %s\n", res.Upload.ObjectKey)
+		}
+		if res.Upload.Err != "" {
+			fmt.Fprintf(stdout, "  说明          : %s\n", res.Upload.Err)
+		}
+	}
 	fmt.Fprintf(stdout, "耗时            : %s\n", res.Duration)
 	fmt.Fprintf(stdout, "结果            : %s\n", okText(res.OK))
 
+	// 作业成功但上传没成功时，退出码给 5（部分成功）：
+	// 数据安全地留在本地，但没到该到的地方，脚本应当能区分这两种结局。
 	if !res.OK {
 		return cli.ExitPartial
 	}
+	if res.ProductPath != "" && res.Upload.Result != "" && !res.Upload.OK && res.Upload.Attempted {
+		return cli.ExitPartial
+	}
 	return cli.ExitOK
+}
+
+// collectDecisionText 把采集判定翻译成一行中文。
+func collectDecisionText(d collectpolicy.Decision) string {
+	switch {
+	case d.ExemptMarkerFound:
+		return "豁免（盘根有授权标记）"
+	case d.Collect:
+		return "允许采集"
+	case d.Reason == collectpolicy.ReasonDisabled:
+		return "拒绝（采集策略为 off）"
+	case d.Reason == collectpolicy.ReasonMarkerAbsent:
+		return "拒绝（未找到采集标记）"
+	case d.Reason != "":
+		return "拒绝（" + d.Reason + "）"
+	default:
+		return "拒绝"
+	}
+}
+
+// uploadText 把上传结果翻译成一行中文。
+func uploadText(u backup.UploadResult) string {
+	switch u.Result {
+	case backup.Uploaded:
+		s := fmt.Sprintf("已上传（%s）", fsutil.HumanBytes(u.Bytes))
+		switch u.LocalAction {
+		case "deleted":
+			s += "，本地副本已删除"
+		case "kept":
+			s += "，本地副本保留"
+		}
+		return s
+	case backup.UploadFailed:
+		return "失败（本地产物已保留，可用 `upload` 子命令补传）"
+	case backup.UploadUnavailable:
+		return "未执行（凭据不可用，已退回仅本地产物）"
+	case backup.UploadNotEnabled:
+		return "未开启（配置中 upload.enabled = false）"
+	default:
+		return u.Result
+	}
+}
+
+// yesNoText 按布尔值选择两句说明里的一句。
+func yesNoText(b bool, yes, no string) string {
+	if b {
+		return yes
+	}
+	return no
 }
 
 // ---- 只读诊断 ----
@@ -583,62 +631,63 @@ func cmdProbe(args []string, cfgPath string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "  卷标 / 文件系统 : %s / %s\n",
 		winvol.LabelOrFallback(v), emptyDash(v.FileSystem))
-	fmt.Fprintf(stdout, "  卷序列号        : %08X\n", v.SerialNumber)
+	fmt.Fprintf(stdout, "  卷序列号        : %08X（仅供事后对账，不参与准入判定）\n", v.SerialNumber)
 	fmt.Fprintf(stdout, "  总容量/已占用/剩余: %s / %s / %s\n",
 		fsutil.HumanBytes(v.TotalBytes), fsutil.HumanBytes(v.UsedBytes), fsutil.HumanBytes(v.FreeBytes))
-	fmt.Fprintf(stdout, "  产物命名(分支B) : %s\n", backup.ProductName(v))
+	fmt.Fprintf(stdout, "  产物命名        : %s\n", backup.ProductName(v))
 
-	m, err := keyfile.NewMatcher(cfg.Detect.ExtraNamePatterns, cfg.Detect.ExtraContentMarkers, cfg.Detect.MaxHeadersBytes)
-	if err != nil {
-		fmt.Fprintf(stderr, "错误：构造检测器失败：%v\n", err)
+	// 采集准入：授权标记豁免 + 策略判定。这一步**只 Stat 两个文件名**，
+	// 不打开盘上任何文件，所以 probe 在满盘上也几乎是瞬时的。
+	policy, perr := collectpolicy.Normalize(cfg.Collect.Policy)
+	if perr != nil {
+		fmt.Fprintf(stderr, "错误：%v\n", perr)
 		return cli.ExitRuntime
 	}
-	// 客户端模式下 cfg.PublicKeyPath 是占位串 `<内嵌于客户端>`，读它必然失败。
-	// 必须先用内嵌公钥算指纹，否则标记判定拿不到期望值，会退化成全盘遍历
-	// （在装着大量文件的盘上会被扫描上限截断，probe 的结论就不可信了）。
-	fp := ""
-	if clientBuild.ok && clientBuild.pub != nil {
-		if _, got, err := keystore.PublicKeyFingerprint(clientBuild.pub); err == nil {
-			fp = got
-		}
-	} else if cfg.PublicKeyPath != "" {
-		if got, err := loadPubFingerprint(cfg.PublicKeyPath); err == nil {
-			fp = got
-		}
-	}
-	res, err := keyfile.Scan(context.Background(), keyfile.Options{
-		Root: root, Matcher: m, Detect: cfg.Detect, AllowedFingerprint: fp,
+	dec, derr := collectpolicy.Decide(root, collectpolicy.Options{
+		Policy:       policy,
+		Marker:       cfg.Collect.MarkerFile,
+		ExemptMarker: cfg.Collect.ExemptMarkerFile,
 	})
-	if err != nil {
-		fmt.Fprintf(stderr, "检测失败：%v\n", err)
+	if derr != nil {
+		fmt.Fprintf(stderr, "错误：%v\n", derr)
 		return cli.ExitRuntime
 	}
-	// 只输出布尔值与计数，不输出命中文件名（G-02）。
-	fmt.Fprintf(stdout, "  私钥存在性      : %v（命中 %d 次，类型 %v）\n",
-		res.Authorized, res.HitCount, res.Kinds)
-	fmt.Fprintf(stdout, "  检测开销        : 检查 %d 个文件 / %d 个目录，读取 %s，耗时 %s%s\n",
-		res.FilesScanned, res.DirsScanned, fsutil.HumanBytes(res.BytesRead), res.Duration,
-		truncatedNote(res.Truncated))
+	fmt.Fprintf(stdout, "  采集策略        : %s\n", policy.Describe())
+	fmt.Fprintf(stdout, "  授权标记检查    : %s（%s）\n",
+		yesNo(dec.ExemptMarkerFound), cfg.Collect.ExemptMarkerFile)
+	if policy.NeedsMarker() {
+		fmt.Fprintf(stdout, "  采集标记检查    : %s（%s）\n",
+			yesNo(dec.MarkerFound), cfg.Collect.MarkerFile)
+	}
 
-	if res.Authorized {
-		target, cerr := copierTarget(cfg, root)
-		if cerr != nil {
-			fmt.Fprintf(stdout, "  将执行          : 分支 A（回写本地备份）— 前置校验未通过：%v\n", cerr)
+	if !dec.Collect {
+		fmt.Fprintf(stdout, "  判定            : 不采集（%s）\n", dec.Reason)
+		if dec.ExemptMarkerFound {
+			fmt.Fprintln(stdout, "                    本盘被识别为自己的盘 → 豁免，不会读取或上传其内容。")
+		}
+		return cli.ExitOK
+	}
+
+	gate := winvol.EvaluateGate(v, cfg.Gate.UsedThresholdBytes, cfg.Gate.MaxTotalBytes)
+	if !gate.Proceed {
+		fmt.Fprintf(stdout, "  判定            : 跳过（%s）\n", gate.Reason)
+		return cli.ExitOK
+	}
+
+	fmt.Fprintf(stdout, "  将执行          : 整盘打包 → 混合加密 → %s\n",
+		filepath.Join(config.ExpandPath(cfg.OutputDir), backup.ProductName(v)))
+	if cfg.Upload.Enabled {
+		// 这里只说"配置上会尝试上传"。真的能不能传，要看凭据能不能在本机解开，
+		// 以及 endpoint 通不通——probe 刻意不发任何网络请求。
+		fmt.Fprintln(stdout, "                    随后尝试上传到 R2（本命令不发网络请求，不做实际验证）")
+		if _, err := credSummary(cfg); err != nil {
+			fmt.Fprintf(stdout, "  [警告] 凭据不可用，届时会退回仅本地产物：%v\n", err)
 			return cli.ExitPartial
 		}
-		fmt.Fprintf(stdout, "  将执行          : 分支 A — 把 %s 复制到 %s\n",
-			config.ExpandPath(cfg.BackupSourceDir), target)
-		fmt.Fprintln(stdout, "                    只在该目录内写入，不删除源盘任何文件。")
 	} else {
-		policy := winvol.EvaluateGate(v, cfg.Gate.UsedThresholdBytes, cfg.Gate.MaxTotalBytes)
-		if policy.Proceed {
-			fmt.Fprintf(stdout, "  将执行          : 分支 B — 整盘打包并混合加密到 %s\\%s\n",
-				config.ExpandPath(cfg.OutputDir), backup.ProductName(v))
-			fmt.Fprintln(stdout, "                    源盘只读，不删除源文件。")
-		} else {
-			fmt.Fprintf(stdout, "  将执行          : 跳过（%s）\n", policy.Reason)
-		}
+		fmt.Fprintln(stdout, "                    上传未开启（upload.enabled = false），产物只落本地")
 	}
+	fmt.Fprintln(stdout, "                    源盘只读，不删除源文件。")
 	return cli.ExitOK
 }
 
@@ -663,15 +712,36 @@ func cmdConfigCheck(cfgPath string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "  [%s] %s %s\n", mark, name, detail)
 	}
-
-	src := config.ExpandPath(cfg.BackupSourceDir)
-	if st, err := os.Stat(fsutil.LongPath(src)); err == nil && st.IsDir() {
-		report("备份源目录存在", true, src)
-	} else {
-		report("备份源目录存在", false, fmt.Sprintf("%s（授权分支将无数据可回写）", src))
+	// note 用于「不是问题、但值得说一声」的项。这类不该把退出码拉成"部分成功"。
+	note := func(name string, detail string) {
+		fmt.Fprintf(stdout, "  [--  ] %s %s\n", name, detail)
 	}
 
 	out := config.ExpandPath(cfg.OutputDir)
+	if st, err := os.Stat(fsutil.LongPath(out)); err == nil && st.IsDir() {
+		report("产物输出目录存在", true, out)
+	} else {
+		// 目录不存在是正常的首次状态（作业时会 MkdirAll），不算问题。
+		note("产物输出目录存在", fmt.Sprintf("尚未创建：%s（首次作业时自动创建）", out))
+	}
+
+	// 静态合法性：必须是绝对路径，且不能直接指向某个卷的根。
+	//
+	// 前者：相对路径会跟着工作目录跑，SCM 拉起服务时工作目录是 System32，
+	// 产物会落到意想不到的地方。
+	// 后者：把产物目录配成 `E:\` 就等于把 .usbk 写进介质根，
+	// 而介质根正是运行期要扫描的对象——那种情形由流水线里的
+	// archive.CheckSourceGuard 在拿到真实盘符后拦下，这里先做静态提示。
+	switch {
+	case !filepath.IsAbs(out):
+		report("产物输出目录合法", false, fmt.Sprintf("必须是绝对路径（当前 %q 会跟随工作目录变动）", out))
+	case isVolumeRoot(out):
+		report("产物输出目录合法", false,
+			fmt.Sprintf("%s 是卷根：产物会与待采集数据混在同一块盘上，请改到本机目录", out))
+	default:
+		report("产物输出目录合法", true, "绝对路径，且不是卷根")
+	}
+
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		report("产物输出目录可写", false, fmt.Sprintf("%s（%v）", out, err))
 	} else if f, err := os.CreateTemp(out, ".usbbackup-r2-writecheck-*"); err != nil {
@@ -708,11 +778,18 @@ func cmdConfigCheck(cfgPath string, stdout, stderr io.Writer) int {
 		report("审计目录可写", false, fmt.Sprintf("%s（%v）", audit, err))
 	}
 
-	// 扫描源与产物目录必须不在同一卷的包含关系里，否则会递归套娃（G-08）。
-	if err := archiveCheckSourceGuard(src, out); err != nil {
-		report("源守卫（防递归套娃）", false, err.Error())
+	// 源守卫（防递归套娃）的真正落点在流水线里：只有拿到**真实盘符**之后，
+	// 才能判断产物目录是否落在待采集介质之内（archive.CheckSourceGuard）。
+	// 配置阶段没有介质可查，所以这里只能把「产物目录是不是卷根」这条静态线索
+	// 检查出来（上面已做），不再拿输出目录跟自己比较——那样永远判失败。
+
+	// 上传能力：开了就必须能解开凭据，否则会静默退回本地（F-F06）。
+	if !cfg.Upload.Enabled {
+		report("上传到 R2", true, "未开启（upload.enabled = false），产物只落本地")
+	} else if summary, err := credSummary(cfg); err != nil {
+		report("上传到 R2", false, fmt.Sprintf("已开启但凭据不可用，届时会退回仅本地产物：%v", err))
 	} else {
-		report("源守卫（防递归套娃）", true, "输出目录不在扫描源之内")
+		report("上传到 R2", true, summary)
 	}
 
 	if problems > 0 {
@@ -806,6 +883,25 @@ func truncatedNote(t bool) string {
 		return "（已达扫描上限，结果可能不完整）"
 	}
 	return ""
+}
+
+// isVolumeRoot 判断路径是否直接就是某个卷的根（`E:\`、`E:/`、`/`）。
+//
+// 用途：产物目录若指向卷根，就等于把 .usbk 写进可能正在被采集的那块盘，
+// 与「输出目录不得位于扫描源之内」这条守卫直接冲突。运行期有真实盘符时
+// 由 archive.CheckSourceGuard 兜底，配置阶段只能靠这个静态线索先提醒。
+func isVolumeRoot(p string) bool {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return false
+	}
+	trimmed := strings.TrimRight(p, `\/`)
+	// 盘符根：去掉分隔符后形如 `E:`（长度为 2 且第二字符是冒号）。
+	if len(trimmed) == 2 && trimmed[1] == ':' {
+		return true
+	}
+	// 卷影路径（\\?\E:\）与 UNC 根本不在此处判定：它们由运行期守卫兜底。
+	return trimmed == ""
 }
 
 func dirOf(p string) string {

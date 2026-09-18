@@ -472,6 +472,25 @@ func IsEncryptedPrivateKeyPEM(raw []byte) bool {
 	return false
 }
 
+// KeyFileNeedsPassphrase 判断给定路径的 PEM 私钥是否带口令保护。
+//
+// 与 IsEncryptedPrivateKeyPEM 的差别只在"从哪来"：那个收字节，这个收路径。
+// 用途是命令行在打印"下一步"时能说实话——配置里 key_pass_file 空着、私钥却带口令，
+// 这份配置注定失败，应该在 init 的那一刻就讲出来。
+//
+// 文件不存在或不是 PEM 时返回 (false, nil)：调用方此时要判断的是"要不要提示口令"，
+// 而不是"私钥是否有效"；缺失/损坏的私钥会在真正加载它的那一步报更准确的错。
+func KeyFileNeedsPassphrase(path string) (bool, error) {
+	raw, err := os.ReadFile(fsutil.LongPath(path))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("读取私钥文件失败 %s: %w", path, err)
+	}
+	return IsEncryptedPrivateKeyPEM(raw), nil
+}
+
 // PEMKind 判断 PEM 文件属于公钥、私钥还是无法识别（F-703 的前置判断）。
 func PEMKind(data []byte) string {
 	block, _ := pem.Decode(data)

@@ -159,14 +159,19 @@ func TestBuildRefusesOverwriteWithoutForce(t *testing.T) {
 func TestBuildAppliesOverrides(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "client.exe")
 	o := okOptions(t, out)
-	o.SourceDir = "D:/mysource"
 	o.MaxTotal = "0"
+	o.Collect = "marker_only"
+	o.EnableUpload = true
+	o.CredentialFile = "client.json"
 	res, err := Build(o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.SourceDir != "D:/mysource" {
-		t.Errorf("源目录覆盖未生效: %q", res.SourceDir)
+	if res.Config.Collect.Policy != "marker_only" {
+		t.Errorf("采集策略覆盖未生效: %q", res.Config.Collect.Policy)
+	}
+	if !res.UploadEnabled || res.CredentialFile != "client.json" {
+		t.Errorf("上传参数未写入配置: enabled=%v cred=%q", res.UploadEnabled, res.CredentialFile)
 	}
 	if res.MaxTotalText != "不限制" {
 		t.Errorf("上限 0 应显示为不限制，实际 %q", res.MaxTotalText)
@@ -176,6 +181,17 @@ func TestBuildAppliesOverrides(t *testing.T) {
 	}
 	if res.Config.PublicKeyPath != "<内嵌于客户端>" {
 		t.Errorf("公钥路径应为内嵌占位，实际 %q", res.Config.PublicKeyPath)
+	}
+}
+
+// 非法的采集策略必须在**生成时**就报错：等到客户端在目标机器上启动才发现，
+// 那时人已经不在生成机上了。
+func TestBuildRejectsBadCollectPolicy(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "client.exe")
+	o := okOptions(t, out)
+	o.Collect = "collect-everything"
+	if _, err := Build(o); err == nil {
+		t.Fatal("非法采集策略应在生成时报错")
 	}
 }
 
