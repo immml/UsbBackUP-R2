@@ -453,6 +453,8 @@ R2 控制台能签发的**长效 API token 只有四档权限**：
 
 **残余风险，必须知道**：上传凭据泄漏后，持有者不仅能上传伪造对象，还能**读取已有密文、覆盖或删除对象**。前者由端到端加密兜住（没有私钥读不出明文），后者由版本控制兜住。
 
+> **无法自动核验版本控制状态。** 2026-09-19 实测：`GetBucketVersioning` 需要**桶级**权限（`Object Read & Write` 没有，返回 403），而 `ListObjectVersions` 在 R2 上直接是 `501 NotImplemented`。所以"桶版本控制开没开"**只能去 Cloudflare 控制台（R2 → 桶 → Settings → Object Versioning）自己确认**，任何工具都替代不了这一步。
+
 ### 5.2 本项目实际使用的 R2 参数
 
 | 项 | 值 |
@@ -466,6 +468,54 @@ R2 控制台能签发的**长效 API token 只有四档权限**：
 
 对象键形态：`usb/<UTC时间戳>_<净化后的卷标>.zip.usbk`，例如 `usb/20260918T143739Z_OS.zip.usbk`。
 
+> 对象键带 UTC 时间戳，所以**每次上传都是新键**。这防的是"覆盖"，不防"删除"——一旦有凭据泄漏，历史对象是可以被删掉的。所以桶版本控制该开还是要开（见 §5.1）。
+
+#### 5.2.1 权限面实测结论（2026-09-19）
+
+以下不是照抄控制台配的，是对着真端点逐条打出来的：
+
+| 能力 | 结果 | 说明 |
+|---|---|---|
+| `PutObject` | ✅ 允许 | 探活对象写入成功 |
+| `HeadObject` / `GetObject` | ✅ 允许 | 大小核对一致 |
+| `ListObjectsV2` | ✅ 允许 | `usbunseal-r2 ls` 正常工作 |
+| `DeleteObject` | ✅ 允许 | `r2-check` 的探活对象被成功清理 |
+| 换桶写入 | ❌ 403 `AccessDenied` | 对 `usbbackup-other` 写入被拒 → **token 确实只限这一个桶** |
+| `ListBuckets`（账户级） | ❌ 被拒 | 不是账户级 Admin 权限 |
+| `GetBucketLocation` | ✅ 200 | 桶在 `APAC` |
+| `GetBucketVersioning` | ❌ 403 | 需要**桶级**权限，这份 token 没有 |
+| `ListObjectVersions` | ❌ 501 `NotImplemented` | R2 未实现该接口 |
+
+**两点结论**：
+
+1. 这份 token 就是 R2 可达的最小档位（`Object Read & Write` + 仅限 `usbbackup` 桶）。它**能读、能覆盖、能删除**——这不是配置失误，是 R2 没有"只写不读"档位。所以桶版本控制是唯一能兜住误删/覆盖的手段。
+2. **版本控制是否开启，用这份 token 查不出来**（上面两条路都走不通），必须去 Cloudflare 控制台确认。在确认之前，不要把重要介质的唯一副本托付给它。
+
+#### 5.2.2 端到端实测（2026-09-19，真 R2）
+
+```
+口径：DPAPI 凭据的 Windows 客户端 → 真 R2 → 口令凭据的解密器取回
+```
+
+```PowerShell
+# PowerShell（全部在真端点上跑，非假 S3）
+usbkeygen-r2 cred --out client-win.json --from r2.json --scope upload
+usbkeygen-r2 build-client --public keys\usbbackup-r2.pub.pem --o deploy\client.exe `
+  --upload --output-dir D:\usb-r2-real\backup-out --threshold 200GiB --max-total unlimited
+cd deploy; .\client.exe once --yes --drive X: --allow-fixed     # 上传
+```
+
+| 环节 | 结果 |
+|---|---|
+| 上传 | `usb/20260919T133249Z_VOL_X.zip.usbk`（9.27 KiB，耗时 2.06 s） |
+| `usbunseal-r2 ls` | 列出 2 个对象，合计 18.53 KiB |
+| `usbunseal-r2 pull` | 下载 → 解密（1 块）→ 解压 4 文件 |
+| 还原一致性 | `diff -r` **逐字节一致** |
+| 第二次上传 | 新键 `…T133509Z…`，**不覆盖**上一次，`pull --all` 两份都能取回 |
+
+凭据在 Windows 客户端侧走 DPAPI、在解密器侧走口令加密，**同一把 token 出两份凭据**——这正是 §6 那张表要说明的用法。
+
+
 把上面这些填成一份 `r2.json`，之后所有 `cred` 命令都可以用 `--from r2.json` 一次带全（`secret_access_key` 留空则仍会交互询问，推荐就这么留）：
 
 ```json
@@ -477,9 +527,12 @@ R2 控制台能签发的**长效 API token 只有四档权限**：
   "prefix": "usb/",
   "access_key_id": "<你的 Access Key ID>",
   "secret_access_key": "",
-  "label": "office-pc"
+  "label": "office-pc",
+  "scope": "upload"
 }
 ```
+
+> `scope` 只是给凭据贴的**用途标签**，不参与鉴权（R2 那边看的是 token 本身的权限），但它决定 `r2-check` 与 `cred` 输出的提示口径：客户端凭据写 `upload`，解密器凭据写 `both`。文件的 `scope` 会被命令行 `--scope` 覆盖——但**只有显式给了才算覆盖**，不给就沿用文件里的值。
 
 > 注意 `endpoint` **只写协议与主机**，不要带 `/usbbackup` 这段路径——桶名的唯一去处是 `bucket` 字段。带路径会被**明确拒绝**（不是忽略）：S3 客户端按 path-style 自己拼 `/<bucket>/<key>`，端点里的路径会被整段丢掉，于是"我写了桶名"和"实际请求去了哪"从此对不上，而且不会报错。纯粹的尾斜杠（`…com/`）是允许的，与不写路径等价。
 
@@ -740,8 +793,9 @@ archive / r2 / winmon / winvol / keystore / cred / crypto → fsutil, config
 | M7 | R2 上传（SigV4 / 分片 / 重试 / 核对） | ✅ |
 | M8 | 采集策略、上传编排、解密器拉取 | ✅ |
 | M9 | 跨平台凭据（口令加密 / 明文）+ Linux 解密器（`init`/`config`/`ls`/`pull`，amd64 + arm64） | ✅ |
+| M10 | 真 R2 端到端验证（上传 → `ls` → `pull` → 逐字节还原），权限面实测，凭据保护方式分派修错 | ✅ |
 
-测试：**17 个包有测试，共 218 个用例**。核心路径全在上——容量门控、卷标净化、路径守卫与 Zip Slip、加解密往返、篡改/截断/错误密钥拒绝、SigV4 官方已知答案向量、假 S3 端到端（含分片与 Abort）、采集策略与豁免、上传编排与本地去留矩阵、内嵌配置往返与私钥守卫、凭据三种保护方式（DPAPI / 口令 / 明文）的往返与拒绝路径、配置文件的按键合并。
+测试：**17 个包有测试，共 222 个用例**。核心路径全在上——容量门控、卷标净化、路径守卫与 Zip Slip、加解密往返、篡改/截断/错误密钥拒绝、SigV4 官方已知答案向量、假 S3 端到端（含分片与 Abort）、采集策略与豁免、上传编排与本地去留矩阵、内嵌配置往返与私钥守卫、凭据三种保护方式（DPAPI / 口令 / 明文）的往返与拒绝路径、配置文件的按键合并、`--from` 与命令行开关的优先级、上传进度节流的去重。
 
 ### 8.1 两处独立交叉验证
 
@@ -759,7 +813,7 @@ archive / r2 / winmon / winvol / keystore / cred / crypto → fsutil, config
 
 ### 8.3 由"跑一遍"发现并修复的缺陷
 
-单测没有发现、实际跑起来才暴露的问题（这类问题在本项目里出现过 8 次）：
+单测没有发现、实际跑起来才暴露的问题（这类问题在本项目里出现过 10 次）：
 
 1. `WM_DEVICECHANGE` 的接收窗口不能是 `HWND_MESSAGE`——消息专用窗口收不到广播，必须建一个隐藏的顶层窗口（`WS_POPUP`，不设 `WS_VISIBLE`）。
 2. `RegisterDeviceNotificationW` **不支持** `DBT_DEVTYP_VOLUME`（返回 `ERROR_INVALID_DATA`），卷到达只能靠默认广播。
@@ -769,6 +823,8 @@ archive / r2 / winmon / winvol / keystore / cred / crypto → fsutil, config
 6. 分片上传失败时若不用 `context.WithoutCancel` 发 `AbortMultipartUpload`，`ctx` 已取消会导致 abort 也失败，远端留下**计费的**残留分片。
 7. `sc.exe` 的输出是本地化的（中文系统是 GBK），直接转述会乱码——要翻译退出码并只取 ASCII 行。
 8. `objectURL` 会整体覆盖 URL 的 `Path`（path-style 只能由 `bucket` + `key` 拼出），所以**端点里带的路径会被静默丢弃**：写成 `https://<acct>.r2.cloudflarestorage.com/usbbackup` 照样"跑通"，只是请求打到了 `/<bucket>/…` 而不是你写的那段路径。发现方式是拿假 S3 打印实际收到的 `bucket` / `key`，看到路径被吞掉。修法是在 `cred.ValidateEndpoint` 里**拒绝**带路径的端点（而不是继续忽略），并把校验提到"询问 Secret 之前"。
+9. `--from` 里的取值**反盖了显式命令行开关**：`scope` 是唯一一个"默认值本身也是合法取值"的字段（默认 `upload`），于是用 `c.Scope == ""` 判"没给"永远不成立，合并逻辑变成"文件的 `both` 覆盖用户的 `--scope upload`"。其它字段默认值是空串，所以只有这一个中招。修法是向 flag 包问**这个开关到底有没有被设置过**（`fs.Visit`），而不是靠取值猜。
+10. `PutObject` 在收尾时又报了一次 `(size, size)`：传输层写到最后一个字节已经回调过一次，调用方紧接着补报一次，于是**每次上传都多打一行一模一样的 100%**。单文件看不出来，真跑上传时一眼就看到两行。修法是在进度节流里对"状态没变"去重（判断放在节流之后，免得把一次真实推进误当重复吃掉）。
 
 ### 8.4 与 `UsbBackUP` 的独立化说明
 
