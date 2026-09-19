@@ -88,6 +88,16 @@ func cmdCred(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cli.ExitUsage
 	}
 
+	// 哪些 flag 被**显式**给过。只有 scope 需要这个信息：它的默认值恰好也是一个
+	// 合法取值（upload），于是"没给"与"显式给了 upload"用 `== ""` 判不出来，
+	// 只能问 flag 包。其余字段默认值为空串，用 `== ""` 判"未给"就够。
+	scopeSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "scope" {
+			scopeSet = true
+		}
+	})
+
 	c := cred.Credentials{
 		AccountID:    strings.TrimSpace(*accountID),
 		Bucket:       strings.TrimSpace(*bucket),
@@ -147,10 +157,8 @@ func cmdCred(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if c.Label == "" {
 			c.Label = strings.TrimSpace(fc.Label)
 		}
-		if c.Scope == "" || c.Scope == cred.ScopeUpload {
-			if strings.TrimSpace(fc.Scope) != "" {
-				c.Scope = strings.TrimSpace(fc.Scope)
-			}
+		if !scopeSet && strings.TrimSpace(fc.Scope) != "" {
+			c.Scope = strings.TrimSpace(fc.Scope)
 		}
 		if len(secretBytes) == 0 && strings.TrimSpace(fc.SecretAccessKey) != "" {
 			secretBytes = []byte(strings.TrimSpace(fc.SecretAccessKey))

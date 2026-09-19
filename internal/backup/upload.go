@@ -365,6 +365,11 @@ type progressLogger struct {
 	last  time.Time
 	// step 是下次上报的字节门槛，按总量的 10% 递增。
 	step int64
+	// 上一次真的打出去的那一行。用来吃掉末尾的重复上报：
+	// 传输层写到最后一个字节时会报一次 (size, size)，调用方收尾时
+	// 又会补报一次 (size, size)，于是每个文件都多出一行一模一样的 100%。
+	lastDone  int64
+	lastTotal int64
 }
 
 func newProgressLogger(log *slog.Logger, name string, total int64) *progressLogger {
@@ -372,7 +377,16 @@ func newProgressLogger(log *slog.Logger, name string, total int64) *progressLogg
 	if step < 8<<20 {
 		step = 8 << 20 // 小文件也别打太密：至少每 8 MiB 一行
 	}
-	return &progressLogger{log: log, name: name, total: total, start: time.Now(), last: time.Now(), step: step}
+	return &progressLogger{
+		log:       log,
+		name:      name,
+		total:     total,
+		start:     time.Now(),
+		last:      time.Now(),
+		step:      step,
+		lastDone:  -1,
+		lastTotal: total,
+	}
 }
 
 func (p *progressLogger) report(done, total int64) {
@@ -385,8 +399,14 @@ func (p *progressLogger) report(done, total int64) {
 	if done < p.total && done < p.step && time.Since(p.last) < 5*time.Second {
 		return
 	}
+	// 状态没变就别重复打。判断放在节流之后：免得一次真实推进被误当成重复吃掉。
+	if done == p.lastDone && p.total == p.lastTotal {
+		return
+	}
 	p.step = done + p.total/10
 	p.last = time.Now()
+	p.lastDone = done
+	p.lastTotal = p.total
 	pct := "-"
 	if p.total > 0 {
 		pct = fmt.Sprintf("%.0f%%", float64(done)*100/float64(p.total))
