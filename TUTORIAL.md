@@ -527,15 +527,20 @@ cd D:\backup
 ## 9. 组装一个便携工具 U 盘
 
 ```PowerShell
-# PowerShell（管理员）
+# PowerShell
 cd D:\backup
 ..\dist\usbkeygen-r2.exe install-usb `
   --drive I: `
   --subdir backup\tools `
   --keys D:\backup\keys `
   --cred D:\backup\client.json `
+  --threshold 10GiB `
+  --max-total 10GiB `
+  --collect all `
   --force
 ```
+
+`--threshold` / `--max-total` / `--collect` 是**写进盘内 client.exe 的内嵌配置**。装盘时若工具目录里已有一份现成的 `client.exe`，命令会**报错**而不是忽略这几个开关——它改不动已经定死的内嵌块，而静默忽略会让你以为阈值改了、实际盘上跑的仍是旧的。
 
 会写进盘里：
 
@@ -556,6 +561,29 @@ I:\
 盘根有 `.usbbackup-allow`。客户端读到它就知道"这是自己人的盘，里面甚至有私钥"，于是**豁免**：不读取、不打包、不上传。这条判定**不受采集策略影响**——哪怕策略是 `all` 也一样豁免。
 
 **别把 `.usbbackup-allow` 挪进子目录。** 豁免判定只在 `<盘根>\.usbbackup-allow` 处 `Stat` 一次；挪走就检测不到，这个带着私钥的盘就会被当成普通介质打包上传。
+
+**这个文件名与项目 A（不含出站能力的版本）共用。** 装盘时只**追加**指纹、绝不覆盖：A 的判定是逐行比对指纹的，盘根可能已经有 A 写的那行；覆盖会让 A 认不出这块盘，于是 A 把它当普通介质扫描打包——而这块盘里有私钥。所以 `install-usb` 是追加 + 幂等的，重复装盘不会覆盖也不会失败，装完输出里会写明走了哪条分支（新建 / 追加 / 已含相同指纹）。
+
+### 盘内 client.json 是哪种凭据，决定怎么部署
+
+| 保护方式 | 盘插到别的 Windows 机器上 |
+|---|---|
+| 口令加密（`--cred-pass-file` 生成） | **能直接用**，但要给客户端口令 |
+| DPAPI（默认生成） | **不能用**，必须在目标机器上重新 `usbkeygen-r2 cred` 一份 |
+
+口令加密那份最容易踩的坑：**漏给口令不会报错，只是上传被跳过、产物全留在本地**，现场表现是"跑了半天，R2 上什么都没有"。
+
+```PowerShell
+# PowerShell（目标机器上）
+# 客户端只认这两个环境变量，它**没有** --cred-pass-file 开关
+setx USBBACKUP_R2_CRED_PASSPHRASE_FILE "C:\ProgramData\usbbackup-r2\cred.pass"
+I:\backup\tools\client.exe cred-check        # 立刻验证：应列出端点/桶/前缀
+
+# 注册成服务的话，服务以 LocalSystem 运行，用户级变量它看不见
+setx /M USBBACKUP_R2_CRED_PASSPHRASE_FILE "C:\ProgramData\usbbackup-r2\cred.pass"
+```
+
+口令文件本身要放在**盘外**、权限收紧，也不要与客户端同目录。
 
 ### 盘上放不放私钥
 

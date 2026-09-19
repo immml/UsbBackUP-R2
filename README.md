@@ -280,8 +280,8 @@ cd D:\backup
 | `cred` | 生成 `client.json`：默认 DPAPI；`--cred-pass-file` / `--cred-pass` 出口令加密（跨平台）；`--plain-file` 出明文 |
 | `r2-check` | 用凭据做一次探活 + 权限范围检查 |
 | `build-client` | 产出内嵌配置与公钥的客户端 exe |
-| `install-usb` | 组装一个便携工具 U 盘 |
-`build-client` 的覆盖项：`--output-dir` / `--threshold` / `--max-total` / `--collect` / `--upload` / `--no-upload` / `--cred-name` / `--name`。客户端模式**忽略**外部 config.json 与环境变量——否则"硬编码配置"就能靠改配置绕过去。
+| `install-usb` | 组装一个便携工具 U 盘（`--drive` / `--subdir` / `--cred` / `--threshold` / `--max-total` / `--collect` / `--without-private` / `--no-client` / `--force`） |
+`build-client 与 install-usb 的覆盖项`：`--output-dir` / `--threshold` / `--max-total` / `--collect` / `--upload` / `--no-upload` / `--cred-name` / `--name`。客户端模式**忽略**外部 config.json 与环境变量——否则"硬编码配置"就能靠改配置绕过去。**唯一的例外是凭据口令**（`USBBACKUP_R2_CRED_PASSPHRASE[_FILE]`）：它不是配置，而是"怎么解开凭据"的输入，所以客户端也认。
 
 ### 4.3 解密器 `usbunseal-r2`
 
@@ -395,14 +395,30 @@ cd D:\backup
 把工具装到一个 U 盘上，走到哪台机器都能跑：
 
 ```PowerShell
-# PowerShell（管理员）
+# PowerShell
 ..\dist\usbkeygen-r2.exe install-usb `
   --drive I: `
   --subdir backup\tools `
   --keys D:\backup\keys `
   --cred D:\backup\client.json `
+  --threshold 10GiB `
+  --max-total 10GiB `
+  --collect all `
   --force
 ```
+
+| 开关 | 作用 |
+|---|---|
+| `--drive` | 目标 U 盘盘符（必填）。非可移动盘会**拒绝**写入 |
+| `--subdir` | 工具在盘内的子目录（默认盘根）；不接受绝对路径、盘符或 `..` |
+| `--keys` / `--public` / `--private` | 密钥来源 |
+| `--cred` | 一并放进盘内的 R2 凭据；给了就顺手打开客户端的上传能力 |
+| `--threshold` / `--max-total` / `--collect` | **写进内嵌客户端**的容量门控与采集策略 |
+| `--without-private` | 私钥不上盘 |
+| `--no-client` | 不生成 / 不复制 client.exe |
+| `--force` | 覆盖同类文件 |
+
+> `--threshold` / `--max-total` / `--collect` 只能作用于**现场生成**的 client.exe。若工具目录里已经躺着一份现成的 `client.exe`，命令会**报错**而不是忽略这几个开关——静默忽略的后果是"你以为阈值改了，盘上跑的其实还是旧的"，而这种偏差要等到整盘被跳过才会暴露。
 
 盘内布局：
 
@@ -412,13 +428,43 @@ I:\
 └── backup\tools\
     ├── usbsetup-r2.exe / usbkeygen-r2.exe / usbunseal-r2.exe / usbbackup-r2.exe / usbcomp-r2.exe
     ├── client.exe           内嵌配置与公钥
-    ├── client.json          R2 凭据（可选；⚠ DPAPI 只对生成它的那台机器有效）
+    ├── client.json          R2 凭据（可选；保护方式见下）
     ├── keys\usbbackup-r2.pub.pem
     ├── keys\usbbackup-r2.key.pem（默认带；--without-private 可排除）
     └── README.txt
 ```
 
 **`.usbbackup-allow` 是豁免标记，语义是"别采集我"**：工具盘上放着私钥，一旦被采集打包上传就等于把私钥发布到网上。所以这个标记必须在盘根——豁免判定只在 `<盘根>\.usbbackup-allow` 处 `Stat` 一次，挪进子目录就检测不到，这个盘就会被当成普通介质采集走。
+
+**这个文件与项目 A（不含出站能力的版本）共用，装盘时只追加、绝不覆盖。** 原因是 A 的判定要**逐行比对指纹**：盘根可能已经有 A 写的 `fingerprint=…`，整体覆盖会让 A 认不出这块盘，于是 A 把它当普通介质扫描打包——而这块盘里有私钥。一次"顺手覆盖"就足够造成私钥外泄，所以 `install-usb` 是追加 + 幂等的（重复装盘不会越写越长）。
+
+### 4.6.1 盘内 client.json 的两种用法（部署前必读）
+
+盘上带的是哪一份凭据，决定了部署方式完全不同：
+
+| 凭据的保护方式 | 盘插到别的 Windows 机器上 |
+|---|---|
+| `passphrase-aesgcm-v1`（口令加密） | **能直接用**，但要给客户端口令 |
+| `dpapi-machine`（机器绑定） | **不能用**，必须在目标机器上用 `usbkeygen-r2 cred` 现场重生成一份 |
+
+口令加密那份的部署要点——**漏掉口令不会报错，但上传会被跳过、产物只留在本地**，现场表现为"跑了半天，R2 上什么都没有"：
+
+```PowerShell
+# PowerShell（目标机器上，注册服务前）
+# 1) 口令单独存一个文件（别放工具盘、别和客户端同目录）
+Set-Content -Path C:\ProgramData\usbbackup-r2\cred.pass -Value '<你的口令>' -NoNewline -Encoding ascii
+
+# 2) 客户端**只认这两个环境变量**——它没有 --cred-pass-file 开关
+#    （--cred-pass-file 是生成器与解密器的参数）
+setx USBBACKUP_R2_CRED_PASSPHRASE_FILE "C:\ProgramData\usbbackup-r2\cred.pass"
+
+# 3) 立刻验证
+I:\backup\tools\client.exe cred-check
+
+# 4) 要注册成服务的话：服务以 LocalSystem 运行，**用户级变量它看不见**，
+#    必须用管理员权限设成系统级变量，再装服务
+setx /M USBBACKUP_R2_CRED_PASSPHRASE_FILE "C:\ProgramData\usbbackup-r2\cred.pass"
+```
 
 `--without-private` 让私钥不上盘；`--cred` 给了就会顺手打开客户端的上传能力并把凭据一起放进去。
 
@@ -794,8 +840,9 @@ archive / r2 / winmon / winvol / keystore / cred / crypto → fsutil, config
 | M8 | 采集策略、上传编排、解密器拉取 | ✅ |
 | M9 | 跨平台凭据（口令加密 / 明文）+ Linux 解密器（`init`/`config`/`ls`/`pull`，amd64 + arm64） | ✅ |
 | M10 | 真 R2 端到端验证（上传 → `ls` → `pull` → 逐字节还原），权限面实测，凭据保护方式分派修错 | ✅ |
+| M11 | 装盘能力补齐（门控可注入、授权标记改为追加合并、凭据提示对症分派），Windows 目标机部署包落盘并实测 | ✅ |
 
-测试：**17 个包有测试，共 222 个用例**。核心路径全在上——容量门控、卷标净化、路径守卫与 Zip Slip、加解密往返、篡改/截断/错误密钥拒绝、SigV4 官方已知答案向量、假 S3 端到端（含分片与 Abort）、采集策略与豁免、上传编排与本地去留矩阵、内嵌配置往返与私钥守卫、凭据三种保护方式（DPAPI / 口令 / 明文）的往返与拒绝路径、配置文件的按键合并、`--from` 与命令行开关的优先级、上传进度节流的去重。
+测试：**18 个包有测试，共 232 个用例**。核心路径全在上——容量门控、卷标净化、路径守卫与 Zip Slip、加解密往返、篡改/截断/错误密钥拒绝、SigV4 官方已知答案向量、假 S3 端到端（含分片与 Abort）、采集策略与豁免、上传编排与本地去留矩阵、内嵌配置往返与私钥守卫、凭据三种保护方式（DPAPI / 口令 / 明文）的往返与拒绝路径、配置文件的按键合并、`--from` 与命令行开关的优先级、上传进度节流的去重、装盘时的门控注入与授权标记合并、凭据错误提示的对症分派。
 
 ### 8.1 两处独立交叉验证
 
@@ -813,7 +860,7 @@ archive / r2 / winmon / winvol / keystore / cred / crypto → fsutil, config
 
 ### 8.3 由"跑一遍"发现并修复的缺陷
 
-单测没有发现、实际跑起来才暴露的问题（这类问题在本项目里出现过 10 次）：
+单测没有发现、实际跑起来才暴露的问题（这类问题在本项目里出现过 15 次）：
 
 1. `WM_DEVICECHANGE` 的接收窗口不能是 `HWND_MESSAGE`——消息专用窗口收不到广播，必须建一个隐藏的顶层窗口（`WS_POPUP`，不设 `WS_VISIBLE`）。
 2. `RegisterDeviceNotificationW` **不支持** `DBT_DEVTYP_VOLUME`（返回 `ERROR_INVALID_DATA`），卷到达只能靠默认广播。
@@ -825,6 +872,11 @@ archive / r2 / winmon / winvol / keystore / cred / crypto → fsutil, config
 8. `objectURL` 会整体覆盖 URL 的 `Path`（path-style 只能由 `bucket` + `key` 拼出），所以**端点里带的路径会被静默丢弃**：写成 `https://<acct>.r2.cloudflarestorage.com/usbbackup` 照样"跑通"，只是请求打到了 `/<bucket>/…` 而不是你写的那段路径。发现方式是拿假 S3 打印实际收到的 `bucket` / `key`，看到路径被吞掉。修法是在 `cred.ValidateEndpoint` 里**拒绝**带路径的端点（而不是继续忽略），并把校验提到"询问 Secret 之前"。
 9. `--from` 里的取值**反盖了显式命令行开关**：`scope` 是唯一一个"默认值本身也是合法取值"的字段（默认 `upload`），于是用 `c.Scope == ""` 判"没给"永远不成立，合并逻辑变成"文件的 `both` 覆盖用户的 `--scope upload`"。其它字段默认值是空串，所以只有这一个中招。修法是向 flag 包问**这个开关到底有没有被设置过**（`fs.Visit`），而不是靠取值猜。
 10. `PutObject` 在收尾时又报了一次 `(size, size)`：传输层写到最后一个字节已经回调过一次，调用方紧接着补报一次，于是**每次上传都多打一行一模一样的 100%**。单文件看不出来，真跑上传时一眼就看到两行。修法是在进度节流里对"状态没变"去重（判断放在节流之后，免得把一次真实推进误当重复吃掉）。
+11. `install-usb` 写授权标记时用 `writeFile(..., Force)` **整体覆盖**。可那个文件名与项目 A 共用，而 A 的判定是**逐行比对指纹**的：盘根已经有 A 写的 `fingerprint=…`，覆盖之后 A 认不出这块盘，于是 A 把这支**装着私钥**的工具盘当普通介质扫描打包。发现方式是装盘前先 `cat` 一眼盘根那个文件。修法改成"追加 + 幂等"，并把"A 怎么解析这个文件"写进注释——跨项目共用一个文件时，得按**对方**的解析规则来写。
+12. `install-usb` 的输出把凭据保护方式**写死成 DPAPI**（"仅对生成它的那台机器有效"）。装的是口令加密凭据时这话是错的，现场会以为必须换机重生成，白跑一趟。修法是按 `cred.ProtectionOf` 分派文案；盘内 README 同理，且认不出保护方式时写"未能识别"而不是猜一个。
+13. `install-usb` **无法注入容量门控**——盘上的 client.exe 只能用内置默认值。而它还有一个更隐蔽的分支：工具目录里若已有 `client.exe` 就直接**复用**，此时 `--threshold` 会被**静默忽略**。前者补 `--threshold` / `--max-total` / `--collect` 开关（并打印写进二进制的实际值），后者改成报错：静默忽略的后果是"你以为阈值改了，盘上跑的其实还是旧的"。
+14. 读凭据失败时一律打印"常见原因：文件来自别的机器（DPAPI 解不开）、被截断…"。于是**只是忘了设口令环境变量**的人会跑去重新生成凭据，而真正的修法只是加一个环境变量。修法是按错误类型（`errors.Is`）分派对症的下一步。
+15. 盘内 README 把口令来源写成"`--cred-pass-file <文件>`、环境变量…"，但**客户端根本没有这个开关**（只有生成器与解密器有）。照着敲会得到一条不存在的命令。修法是只写 `USBBACKUP_R2_CRED_PASSPHRASE[_FILE]`，并补上两条现场最难查的信息：漏设口令不会报错、只是上传被静默跳过；以及服务以 LocalSystem 运行、看不见用户级变量。
 
 ### 8.4 与 `UsbBackUP` 的独立化说明
 
