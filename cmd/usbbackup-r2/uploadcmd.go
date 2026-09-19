@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rsa"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/immml/UsbBackUP-R2/internal/backup"
 	"github.com/immml/UsbBackUP-R2/internal/cli"
+	"github.com/immml/UsbBackUP-R2/internal/cred"
 	"github.com/immml/UsbBackUP-R2/internal/fsutil"
 )
 
@@ -115,7 +117,7 @@ func cmdCredCheck(cfgPath string, stdout, stderr io.Writer) int {
 	summary, err := credSummary(cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "\n凭据不可用：%v\n", err)
-		fmt.Fprintln(stderr, "常见原因：文件来自别的机器（DPAPI 解不开）、被截断，或不是本工具生成的。")
+		fmt.Fprintf(stderr, "怎么处理：%s\n", credErrorHint(err))
 		return cli.ExitRuntime
 	}
 	fmt.Fprintf(stdout, "\n生效凭据：\n  %s\n", summary)
@@ -137,4 +139,29 @@ func embeddedPublicKey() *rsa.PublicKey {
 		return clientBuild.pub
 	}
 	return nil
+}
+
+// credErrorHint 把凭据加载失败翻译成**对症**的下一步。
+//
+// 必须按错误类型分派。原先不管什么错都打印同一句
+// "文件来自别的机器（DPAPI 解不开）、被截断，或不是本工具生成的"，
+// 于是"我只是忘了设口令环境变量"的人会跑去重新生成凭据——白折腾一趟，
+// 而真正的修法只是加一个环境变量。
+func credErrorHint(err error) string {
+	switch {
+	case errors.Is(err, cred.ErrPassphraseRequired):
+		return "凭据是口令加密的，但这次没拿到口令。设 USBBACKUP_R2_CRED_PASSPHRASE_FILE 指向含口令的文件，" +
+			"或设 USBBACKUP_R2_CRED_PASSPHRASE。（客户端没有 --cred-pass-file 开关，它只认这两个环境变量；" +
+			"生成器与解密器才有 --cred-pass-file。）服务模式下还要注意：服务以 LocalSystem 运行，用户级变量它看不见，要用 setx /M。"
+	case errors.Is(err, cred.ErrPassphraseWrong):
+		return "口令不对。口令没有找回途径：换用记得住的那份，或重新生成一份凭据。"
+	case errors.Is(err, cred.ErrPlainFileNotAllowed):
+		return "凭据是明文的，读取需要显式放行（生成器 / 解密器加 --allow-plain-cred）。"
+	case errors.Is(err, cred.ErrUnsupportedPlatform), errors.Is(err, cred.ErrUnprotectFailed):
+		return "凭据是 DPAPI 机器绑定的，只能在生成它的那台 Windows 上解开。换机器请在目标机器上重新生成一份。"
+	case errors.Is(err, cred.ErrBadProtection):
+		return "凭据文件的 protection 字段不被识别——可能是更新版本写的，或文件被改过。"
+	default:
+		return "文件可能被截断或不是本工具生成的。"
+	}
 }

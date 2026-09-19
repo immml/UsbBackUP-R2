@@ -11,6 +11,8 @@ import (
 
 	"github.com/immml/UsbBackUP-R2/internal/cli"
 	"github.com/immml/UsbBackUP-R2/internal/clientgen"
+	"github.com/immml/UsbBackUP-R2/internal/collectpolicy"
+	"github.com/immml/UsbBackUP-R2/internal/cred"
 	"github.com/immml/UsbBackUP-R2/internal/keystore"
 	"github.com/immml/UsbBackUP-R2/internal/version"
 	"github.com/immml/UsbBackUP-R2/internal/winvol"
@@ -42,6 +44,17 @@ type toolkitOptions struct {
 	WithClient bool
 	// CredentialPath 是可选的 R2 凭据文件，给了就一并放进盘里并让客户端带上上传能力。
 	CredentialPath string
+
+	// Threshold / MaxTotal / Collect 覆盖内嵌客户端里的容量门控与采集策略。
+	//
+	// 这三个必须在这里可注入：装盘产出的 client.exe 是要直接拷到目标机器上跑的，
+	// 若只能用内置默认值，就没办法为现场调整门控——而默认阈值（10 GiB）
+	// 对大容量介质、或者反过来"我只想备小盘"的场景都不一定合适。
+	// 空串表示沿用内置默认配置。
+	Threshold string
+	MaxTotal  string
+	Collect   string
+
 	// Force 允许覆盖已存在的同名文件。
 	Force bool
 }
@@ -71,6 +84,9 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 	priv := fs.String("private", "", "私钥路径（默认与本程序同目录的 keys/usbbackup-r2.key.pem）")
 	keyDir := fs.String("keys", "", "密钥目录（同时给出公钥与私钥时可只写这一项）")
 	credPath := fs.String("cred", "", "一并放进盘内的 R2 凭据 client.json（可选，给了则客户端带上传能力）")
+	threshold := fs.String("threshold", "", "内嵌客户端的容量门控阈值（如 10GiB；空则用内置默认）")
+	maxTotal := fs.String("max-total", "", "内嵌客户端的打包体积上限（如 10GiB；0 / unlimited 表示不限制）")
+	collect := fs.String("collect", "", "内嵌客户端的采集策略：all / marker_only / off")
 	withoutPriv := fs.Bool("without-private", false, "不把私钥写进 U 盘")
 	noClient := fs.Bool("no-client", false, "不生成/复制 client.exe")
 	force := fs.Bool("force", false, "目标已有同名文件时覆盖")
@@ -78,8 +94,18 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 		return cli.ExitUsage
 	}
 	if strings.TrimSpace(*drive) == "" {
-		fmt.Fprintln(stderr, "用法：usbkeygen-r2 install-usb --drive E: [--keys DIR] [--without-private] [--no-client] [--force]")
+		fmt.Fprintln(stderr, "用法：usbkeygen-r2 install-usb --drive E: [--keys DIR] [--subdir backup\\tools]")
+		fmt.Fprintln(stderr, "      [--cred client.json] [--threshold 10GiB] [--max-total 10GiB] [--collect all]")
+		fmt.Fprintln(stderr, "      [--without-private] [--no-client] [--force]")
 		return cli.ExitUsage
+	}
+	// 采集策略先校验再动手：写坏一块盘要全部重来，而这些值在动手前就能判断对错。
+	// 非法取值必须当场报错，不能静默退回默认——那会让人以为生效了。
+	if strings.TrimSpace(*collect) != "" {
+		if _, err := collectpolicy.Normalize(*collect); err != nil {
+			fmt.Fprintf(stderr, "错误：%v\n", err)
+			return cli.ExitUsage
+		}
 	}
 	// 先规范化再校验：非法值（绝对路径 / 含 ..）直接按"不指定"处理会让人以为生效了，
 	// 所以这里明确报错，而不是静默退化。
@@ -160,6 +186,9 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 		WithPrivate:    withPriv,
 		WithClient:     !*noClient,
 		CredentialPath: strings.TrimSpace(*credPath),
+		Threshold:      strings.TrimSpace(*threshold),
+		MaxTotal:       strings.TrimSpace(*maxTotal),
+		Collect:        strings.TrimSpace(*collect),
 		Force:          *force,
 	}, stdout)
 	if err != nil {
@@ -186,8 +215,25 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  用法：把本盘插到目标机器，运行 %s（先 accept 一次，之后静默）；\n",
 		pathOnDisk(root, sub, "client.exe"))
 	if strings.TrimSpace(*credPath) != "" {
-		fmt.Fprintln(stdout, "        客户端会按盘内 client.json 把加密产物自动上传到 R2；")
-		fmt.Fprintln(stdout, "        注意 DPAPI 凭据与**目标机器**绑定，本盘上的这份要重新生成才有效。")
+		fmt.Fprintln(stdout, "        客户端会按盘内 client.json 把加密产物自动上传到 R2。")
+		// 按凭据**实际**的保护方式给部署提示。写死成 DPAPI 会让拿着口令凭据的人
+		// 以为"必须换机重生成"，白跑一趟；反过来则更糟。
+		switch credentialProtection(*credPath) {
+		case cred.ProtectionDPAPIMachine:
+			fmt.Fprintln(stdout, "        [!] 这份凭据是 DPAPI 机器绑定的：本盘上的它**只在生成它的那台机器上**有效，")
+			fmt.Fprintln(stdout, "            换机器要先用 usbkeygen-r2 cred 现场重生成一份。")
+		case cred.ProtectionPassphrase:
+			fmt.Fprintln(stdout, "        这份凭据是口令加密的，**任何 Windows 机器都能用**——")
+			fmt.Fprintln(stdout, "        但客户端只认两个环境变量（它没有 --cred-pass-file 开关）：")
+			fmt.Fprintln(stdout, "          USBBACKUP_R2_CRED_PASSPHRASE_FILE / USBBACKUP_R2_CRED_PASSPHRASE")
+			fmt.Fprintln(stdout, "        漏设不会报错，只是上传被跳过、产物只留本地——请照盘上 README 第 0 步做。")
+			fmt.Fprintln(stdout, "        口令**没有写在盘上**（按设计），请另行保管。")
+		case cred.ProtectionPlainFile:
+			fmt.Fprintln(stdout, "        [!] 这份凭据是**明文**的，读到盘就拿到了 R2 访问权；")
+			fmt.Fprintln(stdout, "            读取时还需显式加 --allow-plain-cred。")
+		default:
+			fmt.Fprintln(stdout, "        [!] 这份凭据的保护方式未能识别，部署前请自行确认。")
+		}
 	}
 	fmt.Fprintf(stdout, "        取回 .usbk 后，用 usbunseal-r2.exe 解密还原：\n")
 	fmt.Fprintln(stdout, "          usbunseal-r2.exe pull --out <目录> --key keys\\usbbackup-r2.key.pem")
@@ -220,13 +266,29 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 	}
 
 	// 2) 客户端：优先复用同目录已有的，否则现场生成一个。
+	//
+	// gateXxx 记录**实际写进二进制**的门控值，交给第 5 步的 README 如实写下来。
+	// 装盘之后无从反查内嵌块，说明文件里含糊就等于没有。
+	var gateThreshold, gateMaxTotal, gateCollect string
+	gateFromExisting := false
 	if opt.WithClient {
 		dst := filepath.Join(base, "client.exe")
 		clientSrc := filepath.Join(opt.ToolDir, "client.exe")
 		if _, err := os.Stat(clientSrc); err == nil {
+			// 复用已有的 client.exe 时，--threshold / --max-total / --collect 无处可施：
+			// 内嵌块已经定死在那个二进制里了。这种情况必须报错而不是忽略——
+			// 忽略的后果是"你以为阈值改了，盘上跑的其实还是旧的"，
+			// 而这种偏差要等到整盘被跳过、或上传撞上体积上限才会暴露出来。
+			if opt.Threshold != "" || opt.MaxTotal != "" || opt.Collect != "" {
+				return written, fmt.Errorf(
+					"同目录已存在 %s，无法套用 --threshold / --max-total / --collect（内嵌配置已定死）\n"+
+						"      要么去掉这几个开关，改用它的内嵌值；要么先把那份 client.exe 移走，\n"+
+						"      让本命令现场重新生成一个再装盘", clientSrc)
+			}
 			if err := copyFile(clientSrc, dst, opt.Force); err != nil {
 				return written, fmt.Errorf("复制 client.exe 失败: %w", err)
 			}
+			gateFromExisting = true
 			fmt.Fprintf(out, "  [OK] %s（复用已有）\n", relOnDisk(opt, "client.exe"))
 		} else {
 			pubRaw, err := os.ReadFile(opt.PublicKeyPath)
@@ -240,6 +302,9 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 				Template:     filepath.Join(opt.ToolDir, "usbbackup-r2.exe"),
 				Output:       dst,
 				ClientName:   "usb-toolkit",
+				Threshold:    opt.Threshold,
+				MaxTotal:     opt.MaxTotal,
+				Collect:      opt.Collect,
 				Force:        opt.Force,
 			}
 			if opt.CredentialPath != "" {
@@ -252,15 +317,22 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 			}
 			fmt.Fprintf(out, "  [OK] %s（现场生成，%d 位公钥，上传 %v）\n",
 				relOnDisk(opt, "client.exe"), res.KeyBits, res.UploadEnabled)
+			gateThreshold, gateMaxTotal = res.ThresholdText, res.MaxTotalText
+			if res.Config != nil {
+				gateCollect = res.Config.Collect.Policy
+			}
+			fmt.Fprintf(out, "       容量门控：已占用 ≤ %s，打包体积 ≤ %s；采集策略 %s\n",
+				emptyOr(gateThreshold, "默认"), emptyOr(gateMaxTotal, "不限制"), emptyOr(gateCollect, "默认"))
 		}
 		written++
 	}
 
 	// 2b) R2 凭据（可选）。
 	//
-	// 必须提醒的是：凭据是 DPAPI **机器范围**加密的，在这一台电脑上生成的
-	// 拿到目标机器上解不开。所以放进盘里主要是为了"随盘带着走、当场换机重新生成"，
-	// 而不是拿起来就能用。
+	// 这里**不能把保护方式写死**。凭据现在有三种保护方式，装盘的效果完全不同：
+	// DPAPI 那份换机就解不开（盘上带着它只是"便于当场重生成"），
+	// 口令保护的那份则任何 Windows 机器都能用。写死成 DPAPI 会让拿着
+	// 口令凭据的人白跑一趟，反过来更糟——以为换机就能用。
 	if opt.CredentialPath != "" {
 		if _, err := os.Stat(opt.CredentialPath); err != nil {
 			return written, fmt.Errorf("读取 R2 凭据失败: %w", err)
@@ -268,8 +340,8 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 		if err := copyFile(opt.CredentialPath, filepath.Join(base, DefaultCredentialFileName), opt.Force); err != nil {
 			return written, fmt.Errorf("写入 %s 失败: %w", DefaultCredentialFileName, err)
 		}
-		fmt.Fprintf(out, "  [OK] %s（DPAPI 凭据，仅对生成它的那台机器有效）\n",
-			relOnDisk(opt, DefaultCredentialFileName))
+		fmt.Fprintf(out, "  [OK] %s（%s）\n",
+			relOnDisk(opt, DefaultCredentialFileName), protectionShort(credentialProtection(opt.CredentialPath)))
 		written++
 	}
 
@@ -299,8 +371,14 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 	// 4) 授权标记：让客户端**拒绝采集**这个盘。
 	//
 	// 名字与不含出站能力的版本（项目 A）保持一致：两边的工具盘互相认。
-	// 内容写公钥指纹，便于人肉核对"这块盘是谁的"，但判定只看**存在性**——
-	// 能往盘根写文件的人本来就能伪造内容，靠内容做权限判定是假的。
+	// 内容写公钥指纹，便于人肉核对"这块盘是谁的"；本项目的判定只看**存在性**
+	// （能往盘根写文件的人本来就能伪造内容，靠内容做权限判定是假的）。
+	//
+	// 但**写入方式必须是追加，不能覆盖**：项目 A 的判定是逐行比对指纹
+	// （keyfile.MatchAllowMarker），而同一个盘根完全可能已经躺着 A 写的指纹
+	// ——本项目自己的工具盘就是这种情况。整体覆盖会让 A 认不出这块盘，
+	// 于是 A 把它当成普通介质扫描打包，而这块盘里有私钥。
+	// 一次"顺手覆盖"就能造成私钥外泄，所以这里只追加。
 	pubRaw, err := os.ReadFile(opt.PublicKeyPath)
 	if err != nil {
 		return written, err
@@ -313,19 +391,28 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 	if err != nil {
 		return written, err
 	}
-	marker := fmt.Sprintf("# usbbackup-r2 授权标记：本盘被豁免，客户端不会采集/上传它的内容\n"+
-		"# 生成时间 %s（生成器 %s）\nfingerprint=%s\n",
-		time.Now().Format(time.RFC3339), version.Version, fpText)
-	if err := writeFile(filepath.Join(opt.Dest, ".usbbackup-allow"), []byte(marker), opt.Force); err != nil {
+	action, err := mergeExemptMarker(filepath.Join(opt.Dest, ".usbbackup-allow"), fpText)
+	if err != nil {
 		return written, fmt.Errorf("写入授权标记失败: %w", err)
 	}
-	fmt.Fprintln(out, "  [OK] .usbbackup-allow（授权标记 → 本盘被豁免）")
+	fmt.Fprintf(out, "  [OK] .usbbackup-allow（授权标记 → 本盘被豁免；%s）\n", action)
 	written++
 
 	// 5) 说明文件（每次都重写，保证与盘内实际内容一致）。
 	//    README 必须如实反映私钥是否带口令，否则现场的人会按错误的风险等级处理。
 	//    它落在工具目录里，所以文中的相对路径（keys\…）在有无子目录时都成立。
-	readme := toolkitReadme(fpText, opt.WithPrivate, privateIsEncrypted(opt), opt.CredentialPath != "")
+	readme := toolkitReadme(toolkitReadmeInput{
+		Fingerprint:      fpText,
+		HasPrivate:       opt.WithPrivate,
+		PrivateEncrypted: privateIsEncrypted(opt),
+		HasCredential:    strings.TrimSpace(opt.CredentialPath) != "",
+		CredProtection:   credentialProtection(opt.CredentialPath),
+		HasClient:        opt.WithClient,
+		GateThreshold:    gateThreshold,
+		GateMaxTotal:     gateMaxTotal,
+		GateCollect:      gateCollect,
+		GateReused:       gateFromExisting,
+	})
 	if err := writeFile(filepath.Join(base, "README.txt"), []byte(readme), true); err != nil {
 		return written, fmt.Errorf("写入 README.txt 失败: %w", err)
 	}
@@ -378,6 +465,95 @@ func cleanSubDir(sub string) string {
 	return sub
 }
 
+// mergeExemptMarker 把公钥指纹并入盘根的授权标记文件，**绝不删除已有内容**。
+//
+// 为什么不直接覆盖：这个文件名与项目 A 共用，而 A 的判定是**逐行比对指纹**
+// （`keyfile.MatchAllowMarker`）。同一个盘根完全可能已经躺着 A 写的
+// `fingerprint=…`——本项目的工具盘就是这种情况。整体覆盖会让 A 认不出这块盘，
+// 于是 A 把它当普通介质扫描、打包、回写——而这块盘里有私钥。
+// 一次"顺手覆盖"就能造成私钥外泄，所以这里只追加，永远不替换。
+//
+// 顺带把它做成幂等的：重复装盘不会越写越长，也不会因为"文件已存在"而失败。
+//
+// 返回一句动作描述供输出（新建 / 追加 / 已是相同指纹）。
+func mergeExemptMarker(path, fingerprint string) (string, error) {
+	body := func(origin string) string {
+		return fmt.Sprintf("# usbbackup-r2 授权标记：本盘被豁免，客户端不会采集/上传它的内容\n"+
+			"# 生成时间 %s（生成器 %s；%s）\nfingerprint=%s\n",
+			time.Now().Format(time.RFC3339), version.Version, origin, fingerprint)
+	}
+
+	old, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		return "新建", os.WriteFile(path, []byte(body("首次写入")), 0o644)
+	}
+
+	text := string(old)
+	if markerHasFingerprint(text, fingerprint) {
+		// 已有相同指纹（另一个项目写的，或本项目的上一次装盘）：一个字都不动。
+		// 保住原有内容，比"重写一遍更整齐"重要得多。
+		return "已含相同指纹，未改动", nil
+	}
+	if !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
+	text += "\n" + body("追加，原有内容保持不动")
+	return "追加", os.WriteFile(path, []byte(text), 0o644)
+}
+
+// markerHasFingerprint 判断标记内容里是否已经含有该指纹。
+//
+// 逐行比对、跳过注释行、剥离 `fingerprint=` / `pubkey:` 这类标签前缀——
+// 刻意与项目 A 的解析规则保持一致。两边对"这一行算不算同一个指纹"的理解
+// 必须一样，否则会出现"本项目以为写过了、A 却认不出"的错觉。
+func markerHasFingerprint(content, fingerprint string) bool {
+	want := normalizeFingerprint(fingerprint)
+	if want == "" {
+		return false
+	}
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if normalizeFingerprint(stripMarkerLabel(line)) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// stripMarkerLabel 剥掉 `fingerprint=` / `pubkey:` 这类标签前缀。
+// 只有标签名确实已知时才剥——否则会把指纹自身里的分隔符当标签切坏。
+func stripMarkerLabel(line string) string {
+	for _, sep := range []string{"=", ":"} {
+		i := strings.Index(line, sep)
+		if i <= 0 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(line[:i])) {
+		case "fingerprint", "pubkey", "key":
+			return strings.TrimSpace(line[i+len(sep):])
+		}
+	}
+	return line
+}
+
+// normalizeFingerprint 只保留十六进制字符，用来忽略分组空格与大小写差异。
+func normalizeFingerprint(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f':
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // relOnDisk 把盘内相对路径显示成"从盘根算起"的形式，方便核对落点。
 func relOnDisk(opt toolkitOptions, name string) string {
 	if sub := cleanSubDir(opt.SubDir); sub != "" {
@@ -407,8 +583,71 @@ func privateIsEncrypted(opt toolkitOptions) bool {
 	return keystore.IsEncryptedPrivateKeyPEM(raw)
 }
 
+// credentialProtection 读出凭据的保护方式；读不出来返回空串。
+//
+// 空串在 README 里会渲染成"保护方式未知"，而不是替它猜一个——
+// 猜错的方向恰好是危险的：把机器绑定的写成跨机器可用，现场就会
+// 拿着注定解不开的凭据去部署。
+func credentialProtection(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	p, err := cred.ProtectionOf(path)
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
+// protectionShort 把保护方式压成短标签，用于盘内文件清单。
+func protectionShort(p string) string {
+	switch p {
+	case cred.ProtectionDPAPIMachine:
+		return "DPAPI 机器绑定，换机失效"
+	case cred.ProtectionPassphrase:
+		return "口令加密，跨机器可用"
+	case cred.ProtectionPlainFile:
+		return "未加密，仅靠文件权限"
+	case "":
+		return "保护方式未知"
+	default:
+		return p
+	}
+}
+
+// toolkitReadmeInput 是生成盘内说明文件所需的事实。
+//
+// 用结构体而不是长参数表：这些字段会随功能增加（容量门控、凭据保护方式
+// 都是后加的），而"按位置传一串 bool / string"在这种增长方式下极易错位——
+// 把带口令的私钥写成明文只是难听，把机器绑定的凭据写成跨机器可用，
+// 会让人在目标机器上白折腾半天。
+type toolkitReadmeInput struct {
+	// Fingerprint 是公钥指纹文本。
+	Fingerprint string
+	// HasPrivate 表示盘里是否带私钥。
+	HasPrivate bool
+	// PrivateEncrypted 表示私钥是否带口令保护。
+	PrivateEncrypted bool
+	// HasCredential 表示盘里是否带 client.json。
+	HasCredential bool
+	// CredProtection 是 client.json 的保护方式（cred.Protection* 之一）。
+	CredProtection string
+	// HasClient 表示盘里是否有 client.exe。
+	HasClient bool
+	// GateThreshold / GateMaxTotal / GateCollect 是内嵌客户端**实际生效**的值。
+	GateThreshold string
+	GateMaxTotal  string
+	GateCollect   string
+	// GateReused 为 true 表示 client.exe 是复用现成的，门控值本命令无从得知。
+	GateReused bool
+}
+
 // toolkitReadme 生成盘内说明文件。
-func toolkitReadme(fingerprint string, hasPriv, privEncrypted bool, hasCred bool) string {
+//
+// 这份文件是**离线**读物：盘插到目标机器上时，现场的人只有它可看。
+// 所以凡是"换个机器就会不一样"的事实（凭据是否绑机器、门控到底是多少）
+// 都必须写清楚，且必须**如实**——宁可写"未知"，也不要猜一个。
+func toolkitReadme(in toolkitReadmeInput) string {
 	var b strings.Builder
 	b.WriteString("usbbackup-r2 便携工具盘\n")
 	b.WriteString("====================\n\n")
@@ -418,47 +657,100 @@ func toolkitReadme(fingerprint string, hasPriv, privEncrypted bool, hasCred bool
 	b.WriteString("  usbunseal-r2.exe     解压器（用私钥解密还原，支持从 R2 直接拉取）\n")
 	b.WriteString("  usbbackup-r2.exe     主程序 / 客户端模板\n")
 	b.WriteString("  usbcomp-r2.exe       独立压缩器（手工打包某个目录）\n")
-	b.WriteString("  client.exe           已内嵌配置与公钥的客户端\n")
-	if hasCred {
-		b.WriteString("  client.json          R2 凭据（DPAPI 机器范围加密，见下方说明）\n")
+	if in.HasClient {
+		b.WriteString("  client.exe           已内嵌配置与公钥的客户端\n")
+	}
+	if in.HasCredential {
+		fmt.Fprintf(&b, "  client.json          R2 凭据（%s，见下方说明）\n", protectionShort(in.CredProtection))
 	}
 	b.WriteString("  keys/                密钥材料（见下方风险）\n")
 	b.WriteString("  .usbbackup-allow     授权标记（公钥指纹）→ 本盘被豁免，不会被采集\n\n")
+
+	if in.HasClient {
+		b.WriteString("client.exe 内嵌的门控（决定什么样的盘会被备份）\n")
+		if in.GateReused {
+			// 复用现成 client.exe 时本命令改不了内嵌块，也读不出它的值。
+			b.WriteString("  这个 client.exe 是现成的、直接装盘的，取值由它自己的内嵌配置决定。\n")
+			b.WriteString("  查实际值：client.exe config-check\n\n")
+		} else {
+			fmt.Fprintf(&b, "  容量阈值        %s\n", emptyOr(in.GateThreshold, "（按内置默认）"))
+			b.WriteString("                  这块盘**已占用**超过它 → 整盘跳过，不采集也不上传\n")
+			fmt.Fprintf(&b, "  打包体积上限    %s\n", emptyOr(in.GateMaxTotal, "（按内置默认）"))
+			b.WriteString("                  本次**待打包**数据量超过它 → 整盘跳过\n")
+			fmt.Fprintf(&b, "  采集策略        %s\n", emptyOr(in.GateCollect, "（按内置默认）"))
+			b.WriteString("                  all = 未豁免介质一律采集；marker_only = 仅采集标记盘；off = 关闭\n\n")
+		}
+	}
+
 	b.WriteString("怎么用（目标机器上）\n")
+	if in.HasCredential && in.CredProtection == cred.ProtectionPassphrase {
+		b.WriteString("  0) 先让客户端能**读到凭据口令**。漏掉这一步不会报错，但上传会被跳过、\n")
+		b.WriteString("     产物只落在本机 —— 现场表现为\"跑了半天，R2 上什么都没有\"：\n")
+		b.WriteString("       把口令单独写成一个文件（别放本盘、别和客户端同目录），然后\n")
+		b.WriteString("         setx USBBACKUP_R2_CRED_PASSPHRASE_FILE \"C:\\ProgramData\\usbbackup-r2\\cred.pass\"\n")
+		b.WriteString("       要注册成服务的话，服务以 LocalSystem 运行，**用户级变量它看不见**，\n")
+		b.WriteString("       必须用管理员权限 `setx /M ...` 设成系统级变量，再装服务。\n")
+		b.WriteString("       验证：client.exe cred-check 应能解开凭据并列出端点/桶/前缀。\n")
+		b.WriteString("       （客户端只认上面两个环境变量，**没有** --cred-pass-file 开关；\n")
+		b.WriteString("         --cred-pass-file 是生成器与解密器的参数。）\n")
+	}
 	b.WriteString("  1) 插上本盘，运行 client.exe accept   ← 首次确认一次\n")
 	b.WriteString("  2) 运行 client.exe run                ← 之后静默常驻\n")
 	b.WriteString("  3) 密文产物 .usbk 会自动上传到 R2；也可以手工补传：\n")
 	b.WriteString("     usbbackup-r2.exe upload <文件>.usbk\n")
 	b.WriteString("  4) 在放有私钥的机器上取回并解密：\n")
-	b.WriteString("     usbunseal-r2.exe pull --out <目录> --key keys/usbbackup-r2.key.pem --cred client.json\n")
+	b.WriteString("     usbunseal-r2.exe pull --out <目录> --key keys\\usbbackup-r2.key.pem --cred client.json\n")
 	b.WriteString("     （--cred 省略时会依次找 .\\client.json 与 %LOCALAPPDATA%\\usbbackup-r2\\client.json）\n")
 	b.WriteString("     私钥带口令时追加 --pass（交互式）或 --pass-file <口令文件>\n\n")
 	b.WriteString("为什么这个盘不会被采集走\n")
 	b.WriteString("  盘根目录有 .usbbackup-allow（内容是指纹）。客户端读到它就知道\n")
 	b.WriteString("  「这是自己人的盘，里面甚至有私钥」，于是**豁免**：不读取、不打包、不上传。\n")
-	b.WriteString("  这条判定不受采集策略影响——哪怕策略是 all 也一样豁免。\n\n")
+	b.WriteString("  这条判定不受采集策略影响——哪怕策略是 all 也一样豁免。\n")
+	b.WriteString("  注意：这个文件名与不含出站能力的版本共用，装盘时只**追加**指纹、\n")
+	b.WriteString("  从不覆盖——覆盖会把另一个项目写的指纹冲掉，那一边的客户端就会\n")
+	b.WriteString("  反过来采集这块盘。\n\n")
 	b.WriteString("公钥指纹\n")
-	fmt.Fprintf(&b, "  %s\n\n", fingerprint)
-	if hasCred {
+	fmt.Fprintf(&b, "  %s\n\n", in.Fingerprint)
+
+	if in.HasCredential {
 		b.WriteString("关于 client.json（R2 凭据）\n")
-		b.WriteString("  它用 Windows DPAPI 的**机器范围**密钥加密，因此：\n")
-		b.WriteString("  - 在这一台电脑上生成的，拿到别的机器上解不开（这是设计意图，不是故障）；\n")
-		b.WriteString("  - 换机器/重装系统后，在目标机器上重新执行 usbkeygen-r2 cred 生成一份；\n")
-		b.WriteString("  - 泄漏时到 R2 控制台吊销 token 并换一份凭据即可，**不需要**重新编译客户端；\n")
+		switch in.CredProtection {
+		case cred.ProtectionDPAPIMachine:
+			b.WriteString("  它用 Windows DPAPI 的**机器范围**密钥加密，因此：\n")
+			b.WriteString("  - 在这一台电脑上生成的，拿到别的机器上解不开（这是设计意图，不是故障）；\n")
+			b.WriteString("  - 换机器/重装系统后，在目标机器上重新执行 usbkeygen-r2 cred 生成一份。\n")
+		case cred.ProtectionPassphrase:
+			b.WriteString("  它是**口令加密**的（PBKDF2-SHA256 60 万次 + AES-256-GCM），不绑定机器：\n")
+			b.WriteString("  - 任何 Windows 机器上都能用，代价是每次运行都要能拿到口令；\n")
+			b.WriteString("  - **客户端只认环境变量**（它没有 --cred-pass-file 这个开关）：\n")
+			b.WriteString("      USBBACKUP_R2_CRED_PASSPHRASE_FILE=<含口令的文件>   ← 推荐，注意文件权限\n")
+			b.WriteString("      USBBACKUP_R2_CRED_PASSPHRASE=<口令原文>          ← 次选，会进进程环境\n")
+			b.WriteString("    解密器另有 --cred-pass-file，也可以写进它自己的配置文件；\n")
+			b.WriteString("  - 口令**没有写在盘上**（按设计）。盘与口令同时丢失 = R2 凭据泄漏，\n")
+			b.WriteString("    但备份本身仍然解不开——解密还需要私钥口令。\n")
+		case cred.ProtectionPlainFile:
+			b.WriteString("  [!] 它是**明文**凭据，只靠文件权限保护：\n")
+			b.WriteString("  - 读取时还需显式加 --allow-plain-cred；\n")
+			b.WriteString("  - 拿到盘就能直接用这份凭据读写/删除远端对象。\n")
+		default:
+			b.WriteString("  它的保护方式**未能识别**（可能是更新版本写的文件），请自行确认后再用。\n")
+		}
+		b.WriteString("  两点与保护方式无关，但要知道：\n")
+		b.WriteString("  - 泄漏时的处置是「控制台吊销 token + 换一份凭据」，**不需要**重新编译客户端；\n")
 		b.WriteString("  - token 请用「Object Read & Write + 仅限目标桶」，不要用 Admin 两档；\n")
 		b.WriteString("    R2 没有「只写不读」这一档，也不能把长效 token 限定到 key 前缀，\n")
 		b.WriteString("    所以这一档同时能读/覆盖/删除 —— 请给桶开**版本控制**，并定期轮换 token。\n\n")
 	}
-	if hasPriv && privEncrypted {
+	if in.HasPrivate && in.PrivateEncrypted {
 		b.WriteString("[!] 私钥风险（口令保护）\n")
-		b.WriteString("  本目录下的 keys\\usbbackup-r2.key.pem 带口令保护：不知道口令则无法解开。\n")
+		b.WriteString("  keys\\usbbackup-r2.key.pem 带口令保护：不知道口令则无法解开。\n")
 		b.WriteString("  但口令保护不等于安全——盘和口令同时丢失就等于明文丢失：\n")
 		b.WriteString("  - 不要把口令写在这个盘上的任何文件里（包括本文件）；\n")
 		b.WriteString("  - 不要把这个盘插到不受你控制的机器上；\n")
 		b.WriteString("  - 解密时会提示输入口令（usbunseal-r2 --pass）。\n")
-	} else if hasPriv {
+	} else if in.HasPrivate {
 		b.WriteString("[!] 私钥风险（明文，高风险）\n")
-		b.WriteString("  本目录下的 keys\\usbbackup-r2.key.pem 是**明文私钥**，拿到盘就能解密：\n")
+		b.WriteString("  keys\\usbbackup-r2.key.pem 是**明文私钥**，拿到盘就能解密：\n")
 		b.WriteString("  - 盘丢了 = 所有用对应公钥加密的备份都能被解开；\n")
 		b.WriteString("  - 不要把这个盘插到不受你控制的机器上；\n")
 		b.WriteString("  - 更稳妥的做法：换成带口令的私钥，或只带公钥（--without-private 重装）。\n")

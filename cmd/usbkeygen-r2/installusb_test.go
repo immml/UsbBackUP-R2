@@ -14,6 +14,7 @@ import (
 
 	"github.com/immml/UsbBackUP-R2/internal/collectpolicy"
 	"github.com/immml/UsbBackUP-R2/internal/config"
+	"github.com/immml/UsbBackUP-R2/internal/cred"
 	"github.com/immml/UsbBackUP-R2/internal/embedcfg"
 	"github.com/immml/UsbBackUP-R2/internal/keystore"
 )
@@ -258,11 +259,11 @@ func TestCleanSubDirRejectsEscape(t *testing.T) {
 }
 
 func TestToolkitReadmeWarnsOnlyWhenPrivatePresent(t *testing.T) {
-	withPriv := toolkitReadme("aa bb cc", true, false, false)
+	withPriv := toolkitReadme(toolkitReadmeInput{Fingerprint: "aa bb cc", HasPrivate: true})
 	if !strings.Contains(withPriv, "明文私钥") {
 		t.Error("带明文私钥时应有风险提示")
 	}
-	without := toolkitReadme("aa bb cc", false, false, false)
+	without := toolkitReadme(toolkitReadmeInput{Fingerprint: "aa bb cc"})
 	if strings.Contains(without, "明文私钥") {
 		t.Error("不带私钥时不应出现私钥风险提示")
 	}
@@ -273,14 +274,14 @@ func TestToolkitReadmeWarnsOnlyWhenPrivatePresent(t *testing.T) {
 
 func TestToolkitReadmeDistinguishesEncryptedPrivate(t *testing.T) {
 	// 带口令的私钥不能再被描述成"明文"——盘上写错风险等级会误导现场的人。
-	enc := toolkitReadme("aa bb cc", true, true, false)
+	enc := toolkitReadme(toolkitReadmeInput{Fingerprint: "aa bb cc", HasPrivate: true, PrivateEncrypted: true})
 	if strings.Contains(enc, "明文私钥") {
 		t.Error("口令保护的私钥不应被写成明文")
 	}
 	if !strings.Contains(enc, "口令保护") {
 		t.Error("应说明私钥带口令保护")
 	}
-	plain := toolkitReadme("aa bb cc", true, false, false)
+	plain := toolkitReadme(toolkitReadmeInput{Fingerprint: "aa bb cc", HasPrivate: true})
 	if !strings.Contains(plain, "明文私钥") {
 		t.Error("明文私钥应如实标注")
 	}
@@ -289,16 +290,81 @@ func TestToolkitReadmeDistinguishesEncryptedPrivate(t *testing.T) {
 func TestToolkitReadmeExplainsCredentialOnlyWhenPresent(t *testing.T) {
 	// DPAPI 凭据是机器范围的，换台机器就失效。README 不写清楚，
 	// 现场的人会以为"把这个盘换个机器插上就能自动上传"。
-	with := toolkitReadme("aa bb cc", false, false, true)
+	with := toolkitReadme(toolkitReadmeInput{
+		Fingerprint: "aa bb cc", HasCredential: true, CredProtection: cred.ProtectionDPAPIMachine,
+	})
 	if !strings.Contains(with, "DPAPI") || !strings.Contains(with, "别的机器") {
-		t.Error("带凭据时应说明 DPAPI 与机器绑定")
+		t.Error("DPAPI 凭据应说明与机器绑定")
 	}
 	if !strings.Contains(with, "吊销") {
 		t.Error("带凭据时应给出泄漏后的处置办法")
 	}
-	without := toolkitReadme("aa bb cc", false, false, false)
+	without := toolkitReadme(toolkitReadmeInput{Fingerprint: "aa bb cc"})
 	if strings.Contains(without, "DPAPI") {
 		t.Error("不带凭据时不应出现凭据说明")
+	}
+}
+
+// 口令加密的凭据是**跨机器可用**的。README 若照抄 DPAPI 那一套说法，
+// 现场的人会以为要换机重生成，白白多跑一趟；反过来更糟——
+// 把机器绑定的说成跨机器，人会拿着注定解不开的凭据去部署。
+func TestToolkitReadmeTellsPassphraseCredentialApart(t *testing.T) {
+	got := toolkitReadme(toolkitReadmeInput{
+		Fingerprint: "aa bb cc", HasCredential: true, CredProtection: cred.ProtectionPassphrase,
+	})
+	for _, want := range []string{"口令加密", "任何 Windows 机器", "没有写在盘上", "USBBACKUP_R2_CRED_PASSPHRASE"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("口令加密凭据的说明应包含 %q，实际：\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "拿到别的机器上解不开") {
+		t.Error("口令加密的凭据不该被写成换机失效")
+	}
+	// 客户端**没有** --cred-pass-file 这个开关，口令只能走环境变量。
+	// 差一个字，现场就会去敲一条不存在的命令，或者以为要重新生成凭据。
+	if !strings.Contains(got, "客户端只认环境变量") {
+		t.Error("应写明客户端取口令的唯一途径是环境变量")
+	}
+	// 漏设口令不会报错，只是上传被悄悄跳过——这是最难查的一类现场问题。
+	if !strings.Contains(got, "上传会被跳过") {
+		t.Error("应写明漏设口令的后果是上传被跳过")
+	}
+	if !strings.Contains(got, "LocalSystem") {
+		t.Error("应提醒服务模式看不见用户级变量")
+	}
+}
+
+// 保护方式读不出来时必须写"未知"，不能猜一个填上。
+func TestToolkitReadmeAdmitsUnknownCredentialProtection(t *testing.T) {
+	got := toolkitReadme(toolkitReadmeInput{
+		Fingerprint: "aa bb cc", HasCredential: true, CredProtection: "some-future-mode",
+	})
+	if !strings.Contains(got, "未能识别") {
+		t.Errorf("未知保护方式应如实说明，实际：\n%s", got)
+	}
+}
+
+// 门控值被写进二进制之后就再也反查不到了，盘上的 README 必须把它记下来——
+// 否则现场无从核对"这块盘到底会不会备我那支 30 GB 的 U 盘"。
+func TestToolkitReadmeRecordsEffectiveGate(t *testing.T) {
+	got := toolkitReadme(toolkitReadmeInput{
+		Fingerprint: "aa bb cc", HasClient: true,
+		GateThreshold: "10 GiB", GateMaxTotal: "10 GiB", GateCollect: "all",
+	})
+	for _, want := range []string{"10 GiB", "all", "整盘跳过"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("README 应记录生效门控 %q，实际：\n%s", want, got)
+		}
+	}
+
+	// 复用现成 client.exe 时值无从得知，只能引导去问那个二进制本身——
+	// 绝不能编一个出来。
+	reused := toolkitReadme(toolkitReadmeInput{Fingerprint: "aa bb cc", HasClient: true, GateReused: true})
+	if !strings.Contains(reused, "config-check") {
+		t.Error("复用客户端时应引导用 config-check 查实际值")
+	}
+	if strings.Contains(reused, "容量阈值") {
+		t.Error("值不知道时不该编一个出来")
 	}
 }
 
@@ -425,4 +491,169 @@ func mustRead(t *testing.T, p string) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// 装盘必须能把容量门控写进内嵌客户端——否则盘上的 client.exe 只能用
+// 内置默认值，"给这个现场改阈值"这件事就无从做起。
+func TestAssembleToolkitInjectsCapacityGate(t *testing.T) {
+	_, pub, priv := writeTestKeys(t)
+	dest := t.TempDir()
+	if _, err := assembleToolkit(toolkitOptions{
+		Dest: dest, ToolDir: fakeToolDir(t),
+		PublicKeyPath: pub, PrivateKeyPath: priv,
+		WithClient: true, Force: true,
+		Threshold: "6GiB", MaxTotal: "unlimited", Collect: "marker_only",
+	}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	got, err := embedcfg.Read(filepath.Join(dest, "client.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emb config.Config
+	if err := json.Unmarshal(got.ConfigJSON, &emb); err != nil {
+		t.Fatal(err)
+	}
+	if emb.Gate.UsedThresholdBytes != 6<<30 {
+		t.Errorf("容量阈值没有写进客户端：%d", emb.Gate.UsedThresholdBytes)
+	}
+	if emb.Gate.MaxTotalBytes != 0 {
+		t.Errorf("unlimited 应当写成 0，实际 %d", emb.Gate.MaxTotalBytes)
+	}
+	if emb.Collect.Policy != "marker_only" {
+		t.Errorf("采集策略没有写进客户端：%q", emb.Collect.Policy)
+	}
+}
+
+// 复用现成的 client.exe 时，门控开关无处可施，必须报错。
+// 静默忽略的后果是"你以为阈值改了，盘上跑的其实还是旧的"——
+// 这种偏差要等到整盘被跳过、或上传撞上体积上限才会暴露出来。
+func TestAssembleRefusesGateFlagsWhenReusingClient(t *testing.T) {
+	_, pub, priv := writeTestKeys(t)
+	tools := fakeToolDir(t)
+	src, err := os.ReadFile(filepath.Join(tools, "usbbackup-r2.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tools, "client.exe"), src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := t.TempDir()
+	_, err = assembleToolkit(toolkitOptions{
+		Dest: dest, ToolDir: tools,
+		PublicKeyPath: pub, PrivateKeyPath: priv,
+		WithClient: true, Force: true, Threshold: "6GiB",
+	}, io.Discard)
+	if err == nil {
+		t.Fatal("复用了 client.exe 还传 --threshold，必须报错而不是忽略")
+	}
+	if !strings.Contains(err.Error(), "client.exe") {
+		t.Errorf("报错应点名冲突的那个文件，实际：%v", err)
+	}
+
+	// 不传门控开关时复用应当照常成功——否则这个命令就没法用来"补装工具"。
+	if _, err := assembleToolkit(toolkitOptions{
+		Dest: dest, ToolDir: tools,
+		PublicKeyPath: pub, PrivateKeyPath: priv,
+		WithClient: true, Force: true,
+	}, io.Discard); err != nil {
+		t.Fatalf("不传门控开关时复用应成功：%v", err)
+	}
+}
+
+// 授权标记必须**合并**，绝不能整体覆盖。
+//
+// 盘根可能已经有另一个项目写的指纹，而那边的判定是逐行比对指纹的。
+// 覆盖会让那边认不出这块盘，于是它把这支**装着私钥**的工具盘当普通介质
+// 采集打包——这正是本项目最不能出的事故，而且只要一次"顺手覆盖"就会发生。
+func TestMergeExemptMarkerNeverDropsExistingFingerprint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".usbbackup-allow")
+	other := "f36b 2b3c 546a d12d 741e f057 5bfc 90de fa42 c4a3 179c d6c4 2820 9e1f 046b 104d"
+	ours := "4ca2 b645 1111 2222 3333 4444 5555 6666 7777 8888 9999 aaaa bbbb cccc dddd 8f0f"
+	original := "# usbbackup 授权标记：持有该公钥指纹的介质走回写分支\n" +
+		"# 生成时间 2026-09-18T21:13:21+08:00（生成器 2026.09.18）\n" +
+		"fingerprint=" + other + "\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	action, err := mergeExemptMarker(path, ours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "追加" {
+		t.Errorf("应走追加分支，实际 %q", action)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, other) {
+		t.Fatalf("原有指纹被覆盖了——另一边的客户端会把这块盘当普通介质采集：\n%s", text)
+	}
+	if !strings.Contains(text, ours) {
+		t.Fatalf("本次指纹没写进去：\n%s", text)
+	}
+
+	// 幂等：再装一次盘不该越写越长，也不该失败。
+	again, err := mergeExemptMarker(path, ours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != "已含相同指纹，未改动" {
+		t.Errorf("重复装盘应识别为已存在，实际 %q", again)
+	}
+	raw2, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw2) != text {
+		t.Error("重复装盘改动了标记文件的内容")
+	}
+}
+
+// 全新的盘：没有标记文件时应当直接创建。
+func TestMergeExemptMarkerCreatesWhenAbsent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".usbbackup-allow")
+	action, err := mergeExemptMarker(path, "aa bb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "新建" {
+		t.Errorf("应走新建分支，实际 %q", action)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "fingerprint=aa bb") {
+		t.Errorf("新标记内容不符：\n%s", raw)
+	}
+}
+
+// 指纹的比对规则必须与另一边的实现一致（跳注释、剥标签前缀、忽略分组空格
+// 与大小写）。两边理解不一致就会冒出"本项目以为写过了、那边却认不出"。
+func TestMarkerFingerprintParsing(t *testing.T) {
+	other := "f36b 2b3c 546a d12d 741e f057 5bfc 90de fa42 c4a3 179c d6c4 2820 9e1f 046b 104d"
+	compact := strings.ReplaceAll(strings.ToUpper(other), " ", "")
+	cases := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"fingerprint= 前缀", "fingerprint=" + other + "\n", true},
+		{"pubkey: 前缀", "pubkey: " + other + "\n", true},
+		{"裸指纹", other + "\n", true},
+		{"大写且无空格", "FINGERPRINT=" + compact + "\n", true},
+		{"注释里的指纹不算", "# 参考 fingerprint=" + other + "\n", false},
+		{"空内容", "", false},
+		{"别的指纹", "fingerprint=0000 1111\n", false},
+	}
+	for _, tc := range cases {
+		if got := markerHasFingerprint(tc.content, other); got != tc.want {
+			t.Errorf("%s：得到 %v，期望 %v", tc.name, got, tc.want)
+		}
+	}
 }
