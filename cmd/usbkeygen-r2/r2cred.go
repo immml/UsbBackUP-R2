@@ -230,9 +230,24 @@ func cmdCred(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		secretBytes = p
 	}
 	if len(secretBytes) == 0 {
+		// 非终端 stdin（管道 / 重定向 / 从脚本调用）下必须**提前拦**，别让它去读。
+		// 原因：无回显读取会退化成 readPlainPassphrase 直接读 os.Stdin，而同意环节
+		// 已经用 bufio 预读（最多 4 KiB）把整块输入吞进自己的缓冲——这里只会读到
+		// EOF ⇒ Secret 变成空串，一路拖到写凭据时才报"凭据缺少必填字段: secret_access_key"。
+		// 那个提示把原因指向 r2.json，与真实原因（输入根本没读到）毫无关系。（2026-09-20 实测踩到）
+		if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice == 0 {
+			fmt.Fprintln(stderr, "错误：标准输入不是终端，无法交互式读取 Secret Access Key。")
+			fmt.Fprintln(stderr, "  请改用 --secret-file <文件>（文件首行即 Secret，推荐）")
+			fmt.Fprintln(stderr, "  或 --secret-access-key <值>（会留在命令历史与进程列表里，仅限临时使用）。")
+			return cli.ExitUsage
+		}
 		p, err := cli.ReadPassphrase("请输入 R2 Secret Access Key（无回显）：")
 		if err != nil {
 			fmt.Fprintf(stderr, "错误：%v\n", err)
+			return cli.ExitRuntime
+		}
+		if len(p) == 0 {
+			fmt.Fprintln(stderr, "错误：没有读到 Secret Access Key（输入为空），请重试。")
 			return cli.ExitRuntime
 		}
 		secretBytes = p

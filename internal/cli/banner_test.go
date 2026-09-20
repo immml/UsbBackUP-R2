@@ -137,6 +137,33 @@ func TestConfirmAgreement(t *testing.T) {
 	}
 }
 
+// TestConfirmAgreementDoesNotEchoInput 锁住「拒绝时不回显输入内容」。
+//
+// 同意提示就紧挨着光标，用户很容易把本该填进后续提问的 Secret / 口令粘到这里。
+// 原样回显等于把凭据写进屏幕和日志——2026-09-20 部署实测中真实发生过一次，
+// 所以这里连「输入片段」也一并禁止。
+func TestConfirmAgreementDoesNotEchoInput(t *testing.T) {
+	const secret = "13f1a8de1a1b366a186337dcf27ed6880f89cfa6209fc9ea23c01791567f0e91"
+
+	var out bytes.Buffer
+	if err := ConfirmAgreement(strings.NewReader(secret+"\n"), &out); err == nil {
+		t.Fatal("非 I AGREE 输入不应通过")
+	}
+	got := out.String()
+	if strings.Contains(got, secret) {
+		t.Errorf("拒绝提示回显了完整输入：\n%s", got)
+	}
+	for i := 0; i+8 <= len(secret); i++ {
+		if strings.Contains(got, secret[i:i+8]) {
+			t.Fatalf("拒绝提示泄露了输入片段 %q：\n%s", secret[i:i+8], got)
+		}
+	}
+	// 但要报出字符数：让粘错的人能察觉「我粘了一大坨东西进来」。
+	if !strings.Contains(got, "64 个字符") {
+		t.Errorf("应报出输入字符数以便察觉粘错，实际：\n%s", got)
+	}
+}
+
 func TestRenderBannerContainsRequiredNotices(t *testing.T) {
 	var buf bytes.Buffer
 	RenderBanner(&buf, "usbkeygen-r2")

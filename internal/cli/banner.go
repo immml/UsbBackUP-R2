@@ -286,7 +286,12 @@ func ConfirmAgreementBuf(r *bufio.Reader, w io.Writer) error {
 	// 统一空格，容忍 "I  AGREE" 这类多空格写法。
 	normalized := strings.Join(strings.Fields(strings.ToUpper(strings.TrimSpace(line))), " ")
 	if normalized != "I AGREE" {
-		fmt.Fprintf(w, "\n  输入为 %q，未通过确认，已退出。\n", strings.TrimSpace(line))
+		// 不回显输入内容。这里是"粘贴错内容"的高发位置——提示语就在光标上方，
+		// 用户很容易把本该填进后续提问的 Secret / 口令粘到这里。原样回显等于把
+		// 凭据写进屏幕和日志（2026-09-20 实测中真实发生过一次）。只报字符数，
+		// 既能提示"你粘的东西不对"，又不泄露内容。
+		fmt.Fprintf(w, "\n  未通过确认（输入 %d 个字符，内容不予回显，以免误粘的凭据被打印），已退出。\n",
+			len([]rune(strings.TrimSpace(line))))
 		return ErrNotAgreed
 	}
 	fmt.Fprintln(w, "\n  已确认。")
