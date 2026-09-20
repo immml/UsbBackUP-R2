@@ -285,7 +285,7 @@ cd D:\backup
 | `cred` | 生成 `client.json`：默认 DPAPI；`--cred-pass-file` / `--cred-pass` 出口令加密（跨平台）；`--plain-file` 出明文 |
 | `r2-check` | 用凭据做一次探活 + 权限范围检查 |
 | `build-client` | 产出内嵌配置与公钥的客户端 exe |
-| `install-usb` | 组装一个便携工具 U 盘（`--drive` / `--subdir` / `--cred` / `--threshold` / `--max-total` / `--collect` / `--without-private` / `--no-client` / `--force`） |
+| `install-usb` | 组装一个便携工具 U 盘（`--drive` / `--subdir` / `--cred` / `--upload` / `--no-upload` / `--cred-template` / `--threshold` / `--max-total` / `--collect` / `--without-private` / `--no-client` / `--force`） |
 `build-client 与 install-usb 的覆盖项`：`--output-dir` / `--threshold` / `--max-total` / `--collect` / `--upload` / `--no-upload` / `--cred-name` / `--name`。客户端模式**忽略**外部 config.json 与环境变量——否则"硬编码配置"就能靠改配置绕过去。**唯一的例外是凭据口令**（`USBBACKUP_R2_CRED_PASSPHRASE[_FILE]`）：它不是配置，而是"怎么解开凭据"的输入，所以客户端也认。
 
 ### 4.3 解密器 `usbunseal-r2`
@@ -401,11 +401,14 @@ cd D:\backup
 
 ```PowerShell
 # PowerShell
+# 常规形态：盘只当分发介质 —— 打开上传能力，但**不放凭据**，
+# 凭据到目标机器上现场生成（机器绑定、零环境变量）
 ..\dist\usbkeygen-r2.exe install-usb `
   --drive I: `
   --subdir backup\tools `
   --keys D:\backup\keys `
-  --cred D:\backup\client.json `
+  --upload `
+  --cred-template D:\backup\r2-template.json `
   --threshold 10GiB `
   --max-total 10GiB `
   --collect all `
@@ -417,13 +420,24 @@ cd D:\backup
 | `--drive` | 目标 U 盘盘符（必填）。非可移动盘会**拒绝**写入 |
 | `--subdir` | 工具在盘内的子目录（默认盘根）；不接受绝对路径、盘符或 `..` |
 | `--keys` / `--public` / `--private` | 密钥来源 |
-| `--cred` | 一并放进盘内的 R2 凭据；给了就顺手打开客户端的上传能力 |
+| `--cred` | 一并放进盘内的 R2 凭据（`client.json`）；给了就顺手打开上传能力 |
+| `--upload` | **打开上传能力但盘上不放凭据**：凭据在目标机器上现场生成 |
+| `--no-upload` | 强制关闭上传能力（产物只落本地）。与 `--cred` 冲突 |
+| `--cred-template` | 随盘分发的**凭据素材**（写进盘里叫 `r2.json`）；其中的 secret 字段**必须为空**，非空会拒绝写盘 |
 | `--threshold` / `--max-total` / `--collect` | **写进内嵌客户端**的容量门控与采集策略 |
 | `--without-private` | 私钥不上盘 |
 | `--no-client` | 不生成 / 不复制 client.exe |
 | `--force` | 覆盖同类文件 |
 
-> `--threshold` / `--max-total` / `--collect` 只能作用于**现场生成**的 client.exe。若工具目录里已经躺着一份现成的 `client.exe`，命令会**报错**而不是忽略这几个开关——静默忽略的后果是"你以为阈值改了，盘上跑的其实还是旧的"，而这种偏差要等到整盘被跳过才会暴露。
+**上传能力与"带不带凭据"是两件事**，别把二者绑死（曾经就是绑死的，见 §8.3 第 16 条）：
+
+| 你想要的 | 命令 |
+|---|---|
+| 打开上传、凭据在目标机现场生成（**推荐**，工具盘的常规形态） | `--upload --cred-template r2.json` |
+| 上传 + 凭据一起进盘（目标机不想再操作一次） | `--cred client.json` |
+| 只落本地、不上传（离线归档盘） | 两个都不给，或 `--no-upload` |
+
+> `--threshold` / `--max-total` / `--collect` / `--upload` 只能作用于**现场生成**的 client.exe。若工具目录里已经躺着一份现成的 `client.exe`，命令会**报错**而不是忽略这几个开关——静默忽略的后果是"你以为开关改了，盘上跑的其实还是旧的"，而这种偏差要么等到整盘被跳过才暴露，要么干脆等到你发现**什么都没上传**。
 
 盘内布局：
 
@@ -434,6 +448,7 @@ I:\
     ├── usbsetup-r2.exe / usbkeygen-r2.exe / usbunseal-r2.exe / usbbackup-r2.exe / usbcomp-r2.exe
     ├── client.exe           内嵌配置与公钥
     ├── client.json          R2 凭据（可选；保护方式见下）
+    ├── r2.json              凭据素材（可选；**不含 secret**，供目标机器现场生成凭据）
     ├── keys\usbbackup-r2.pub.pem
     ├── keys\usbbackup-r2.key.pem（默认带；--without-private 可排除）
     └── README.txt
@@ -972,7 +987,7 @@ archive / r2 / winmon / winvol / keystore / cred / crypto → fsutil, config
 | M10 | 真 R2 端到端验证（上传 → `ls` → `pull` → 逐字节还原），权限面实测，凭据保护方式分派修错 | ✅ |
 | M11 | 装盘能力补齐（门控可注入、授权标记改为追加合并、凭据提示对症分派），Windows 目标机部署包落盘并实测 | ✅ |
 
-测试：**18 个包有测试，共 232 个用例**。核心路径全在上——容量门控、卷标净化、路径守卫与 Zip Slip、加解密往返、篡改/截断/错误密钥拒绝、SigV4 官方已知答案向量、假 S3 端到端（含分片与 Abort）、采集策略与豁免、上传编排与本地去留矩阵、内嵌配置往返与私钥守卫、凭据三种保护方式（DPAPI / 口令 / 明文）的往返与拒绝路径、配置文件的按键合并、`--from` 与命令行开关的优先级、上传进度节流的去重、装盘时的门控注入与授权标记合并、凭据错误提示的对症分派。
+测试：**18 个包有测试，共 239 个用例**。核心路径全在上——容量门控、卷标净化、路径守卫与 Zip Slip、加解密往返、篡改/截断/错误密钥拒绝、SigV4 官方已知答案向量、假 S3 端到端（含分片与 Abort）、采集策略与豁免、上传编排与本地去留矩阵、内嵌配置往返与私钥守卫、凭据三种保护方式（DPAPI / 口令 / 明文）的往返与拒绝路径、配置文件的按键合并、`--from` 与命令行开关的优先级、上传进度节流的去重、装盘时的门控注入与授权标记合并、上传开关的注入与"素材不得带 secret"的拒绝路径、盘内 README 按实际开关状态分派的措辞。
 
 ### 8.1 两处独立交叉验证
 
@@ -1007,6 +1022,8 @@ archive / r2 / winmon / winvol / keystore / cred / crypto → fsutil, config
 13. `install-usb` **无法注入容量门控**——盘上的 client.exe 只能用内置默认值。而它还有一个更隐蔽的分支：工具目录里若已有 `client.exe` 就直接**复用**，此时 `--threshold` 会被**静默忽略**。前者补 `--threshold` / `--max-total` / `--collect` 开关（并打印写进二进制的实际值），后者改成报错：静默忽略的后果是"你以为阈值改了，盘上跑的其实还是旧的"。
 14. 读凭据失败时一律打印"常见原因：文件来自别的机器（DPAPI 解不开）、被截断…"。于是**只是忘了设口令环境变量**的人会跑去重新生成凭据，而真正的修法只是加一个环境变量。修法是按错误类型（`errors.Is`）分派对症的下一步。
 15. 盘内 README 把口令来源写成"`--cred-pass-file <文件>`、环境变量…"，但**客户端根本没有这个开关**（只有生成器与解密器有）。照着敲会得到一条不存在的命令。修法是只写 `USBBACKUP_R2_CRED_PASSPHRASE[_FILE]`，并补上两条现场最难查的信息：漏设口令不会报错、只是上传被静默跳过；以及服务以 LocalSystem 运行、看不见用户级变量。
+16. `install-usb` 把**上传能力绑死在"有没有 `--cred`"**上，于是"盘只当分发介质、凭据到目标机现场生成"这种常规形态产出的 `client.exe` 是**关着上传**的——而盘内 README 照样写着"密文产物会自动上传到 R2"。现场表现是"跑了半天，R2 上什么都没有"，**且全程不报错**。发现方式是装完盘后顺手跑一次 `client.exe config-check`，看它自己说的 `upload.enabled`。修法：拆成 `--upload` / `--no-upload` / `--cred-template` 三个开关（上传能力与"带不带凭据"解耦），并让盘内 README 按**实际**开关状态写——开着才写"会自动上传"，关着就明说"不会上传"。这条同时也是给"就地改文案"的教训：README 里任何一句状态描述都必须是**算出来的**，不能是常量。
+17. 盘内 README 无条件声明"客户端会优先读盘上这份 `client.json`，它会把你在本地生成的凭据盖掉"——可盘上恰恰没有 `client.json`（只有不含 secret 的素材 `r2.json`）。这话会让人去盘上找一个不存在的文件。同一段还无条件写"直接在盘上跑有**两个**硬伤"。修法：这段也按 `HasCredential` 分派。**根因与第 16 条相同**：把只对某一种盘型成立的判断写成了常量文案。凡是"换个盘型就不成立"的句子，都要能被开关状态驱动。
 
 ### 8.4 与 `UsbBackUP` 的独立化说明
 

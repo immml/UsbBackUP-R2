@@ -45,6 +45,29 @@ type toolkitOptions struct {
 	// CredentialPath 是可选的 R2 凭据文件，给了就一并放进盘里并让客户端带上上传能力。
 	CredentialPath string
 
+	// Upload 显式要求内嵌客户端开启上传能力，**但不在盘上放凭据**。
+	//
+	// 这是工具盘的常规形态：盘只当分发介质，凭据在目标机器上现场生成
+	// （DPAPI 机器绑定档，之后零环境变量）。若把上传能力与"带凭据"绑死，
+	// 这种形态产出的 client.exe 会静默关着上传——而 README 写着"会自动上传到 R2"，
+	// 现场表现就是"跑了半天，R2 上什么都没有"，且不报错。
+	//
+	// 与 CredentialPath 同时给出不冲突（带凭据本就意味着要上传）。
+	Upload bool
+
+	// NoUpload 显式关闭上传能力。与 Upload 互斥。
+	//
+	// 三者都不给时的默认是"有凭据就开、没凭据就关"——保持既有行为不变，
+	// 免得改了默认值把别人已有的脚本产出反过来。
+	NoUpload bool
+
+	// CredTemplatePath 是随盘分发的**凭据素材**（写进盘里叫 r2.json）。
+	//
+	// 它只有路由信息、secret 留空，供目标机器现场生成机器绑定的凭据。
+	// 与 CredentialPath（真正的 client.json）互不相同，也别混用：
+	// 前者是"生成凭据的输入"，后者是"能直接用的凭据"。
+	CredTemplatePath string
+
 	// Threshold / MaxTotal / Collect 覆盖内嵌客户端里的容量门控与采集策略。
 	//
 	// 这三个必须在这里可注入：装盘产出的 client.exe 是要直接拷到目标机器上跑的，
@@ -67,10 +90,15 @@ type toolkitOptions struct {
 //	├── usbsetup-r2.exe / usbkeygen-r2.exe / usbunseal-r2.exe / usbbackup-r2.exe / usbcomp-r2.exe
 //	├── client.exe            生成器产出的客户端（内嵌配置与公钥）
 //	├── client.json           可选：R2 凭据（DPAPI 保护，与 client.exe 同目录）
+//	├── r2.json               可选：凭据素材（**不含 secret**），供目标机器现场生成凭据
 //	├── keys\usbbackup-r2.pub.pem
 //	├── keys\usbbackup-r2.key.pem（默认带；--without-private 可排除）
 //	├── .usbbackup-allow     授权标记，内容是公钥指纹
 //	└── README.txt            用法与私钥风险说明
+//
+// 上传能力与"带不带凭据"是**两件事**：--upload 让内嵌客户端开启上传但盘上不放凭据
+// （凭据在目标机器上现场生成，DPAPI 机器绑定档），--cred 则是凭据 + 上传一起进盘。
+// 只有在这两个都不给时才关闭上传。
 //
 // `.usbbackup-allow` 的语义是**豁免**：客户端读到它就知道"这是自己人的盘，
 // 里面甚至有私钥"，于是拒绝采集——工具盘不会被自己人打包上传。
@@ -84,6 +112,9 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 	priv := fs.String("private", "", "私钥路径（默认与本程序同目录的 keys/usbbackup-r2.key.pem）")
 	keyDir := fs.String("keys", "", "密钥目录（同时给出公钥与私钥时可只写这一项）")
 	credPath := fs.String("cred", "", "一并放进盘内的 R2 凭据 client.json（可选，给了则客户端带上传能力）")
+	upload := fs.Bool("upload", false, "内嵌客户端开启上传能力，但**不**在盘上放凭据（目标机器现场生成）")
+	noUpload := fs.Bool("no-upload", false, "内嵌客户端关闭上传能力（产物只落本地）")
+	credTemplate := fs.String("cred-template", "", "随盘分发的凭据素材（写进盘里叫 r2.json；其中 secret 字段必须为空）")
 	threshold := fs.String("threshold", "", "内嵌客户端的容量门控阈值（如 10GiB；空则用内置默认）")
 	maxTotal := fs.String("max-total", "", "内嵌客户端的打包体积上限（如 10GiB；0 / unlimited 表示不限制）")
 	collect := fs.String("collect", "", "内嵌客户端的采集策略：all / marker_only / off")
@@ -95,8 +126,22 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 	}
 	if strings.TrimSpace(*drive) == "" {
 		fmt.Fprintln(stderr, "用法：usbkeygen-r2 install-usb --drive E: [--keys DIR] [--subdir backup\\tools]")
-		fmt.Fprintln(stderr, "      [--cred client.json] [--threshold 10GiB] [--max-total 10GiB] [--collect all]")
+		fmt.Fprintln(stderr, "      [--cred client.json] [--upload | --no-upload] [--cred-template r2.json]")
+		fmt.Fprintln(stderr, "      [--threshold 10GiB] [--max-total 10GiB] [--collect all]")
 		fmt.Fprintln(stderr, "      [--without-private] [--no-client] [--force]")
+		return cli.ExitUsage
+	}
+	// 两个上传开关互斥：同时给出说明调用方自己也没想清要哪一种，
+	// 硬选一个就会产出与预期相反的盘。
+	if *upload && *noUpload {
+		fmt.Fprintln(stderr, "错误：--upload 与 --no-upload 不能同时给出。")
+		return cli.ExitUsage
+	}
+	// --cred 本身就意味着"要上传"（凭据 + 上传能力一起进盘）。再叠一个
+	// --no-upload 会产出一块"带凭据却不会上传"的盘，没有任何场景需要它。
+	if *noUpload && strings.TrimSpace(*credPath) != "" {
+		fmt.Fprintln(stderr, "错误：--no-upload 与 --cred 冲突——带凭据进盘就是要用它的上传能力。")
+		fmt.Fprintln(stderr, "      只想要凭据、不要上传：别给 --cred，改成先把凭据单独分发。")
 		return cli.ExitUsage
 	}
 	// 采集策略先校验再动手：写坏一块盘要全部重来，而这些值在动手前就能判断对错。
@@ -178,18 +223,21 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "写入私钥  : %v\n\n", withPriv)
 
 	n, err := assembleToolkit(toolkitOptions{
-		Dest:           root,
-		SubDir:         sub,
-		ToolDir:        exeDir,
-		PublicKeyPath:  pubPath,
-		PrivateKeyPath: privPath,
-		WithPrivate:    withPriv,
-		WithClient:     !*noClient,
-		CredentialPath: strings.TrimSpace(*credPath),
-		Threshold:      strings.TrimSpace(*threshold),
-		MaxTotal:       strings.TrimSpace(*maxTotal),
-		Collect:        strings.TrimSpace(*collect),
-		Force:          *force,
+		Dest:             root,
+		SubDir:           sub,
+		ToolDir:          exeDir,
+		PublicKeyPath:    pubPath,
+		PrivateKeyPath:   privPath,
+		WithPrivate:      withPriv,
+		WithClient:       !*noClient,
+		CredentialPath:   strings.TrimSpace(*credPath),
+		Upload:           *upload,
+		NoUpload:         *noUpload,
+		CredTemplatePath: strings.TrimSpace(*credTemplate),
+		Threshold:        strings.TrimSpace(*threshold),
+		MaxTotal:         strings.TrimSpace(*maxTotal),
+		Collect:          strings.TrimSpace(*collect),
+		Force:            *force,
 	}, stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "错误：%v\n", err)
@@ -212,8 +260,10 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintln(stdout, "  这个盘不会再被客户端采集走：盘根有 .usbbackup-allow（授权标记），")
 	fmt.Fprintln(stdout, "  客户端读到它就豁免，不会读取、打包或上传盘上任何内容。")
 	fmt.Fprintln(stdout)
-	fmt.Fprintf(stdout, "  用法：把本盘插到目标机器，运行 %s（先 accept 一次，之后静默）；\n",
+	fmt.Fprintf(stdout, "  用法：把 %s 所在目录整个拷到目标机的本地目录（**别直接在盘上跑**——\n",
 		pathOnDisk(root, sub, "client.exe"))
+	fmt.Fprintln(stdout, "        install-service 会把服务绑死在盘符上，拔盘即失效）；")
+	fmt.Fprintln(stdout, "        在本地目录里先 client.exe accept 一次，之后 client.exe run 静默常驻；")
 	if strings.TrimSpace(*credPath) != "" {
 		fmt.Fprintln(stdout, "        客户端会按盘内 client.json 把加密产物自动上传到 R2。")
 		// 按凭据**实际**的保护方式给部署提示。写死成 DPAPI 会让拿着口令凭据的人
@@ -234,6 +284,11 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 		default:
 			fmt.Fprintln(stdout, "        [!] 这份凭据的保护方式未能识别，部署前请自行确认。")
 		}
+	} else if *upload {
+		fmt.Fprintln(stdout, "        上传能力已开，但本盘**没有**凭据：到了目标机器先跑")
+		fmt.Fprintln(stdout, "          usbkeygen-r2.exe cred --from r2.json --out client.json --scope upload")
+		fmt.Fprintln(stdout, "        生成一份机器绑定的凭据（届时交互询问 Secret），否则不会上传。")
+		fmt.Fprintln(stdout, "        详见盘内 README.txt 的「关于 R2 凭据」一节。")
 	}
 	fmt.Fprintf(stdout, "        取回 .usbk 后，用 usbunseal-r2.exe 解密还原：\n")
 	fmt.Fprintln(stdout, "          usbunseal-r2.exe pull --out <目录> --key keys\\usbbackup-r2.key.pem")
@@ -270,18 +325,21 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 	// gateXxx 记录**实际写进二进制**的门控值，交给第 5 步的 README 如实写下来。
 	// 装盘之后无从反查内嵌块，说明文件里含糊就等于没有。
 	var gateThreshold, gateMaxTotal, gateCollect string
+	gateUpload := false
 	gateFromExisting := false
 	if opt.WithClient {
 		dst := filepath.Join(base, "client.exe")
 		clientSrc := filepath.Join(opt.ToolDir, "client.exe")
 		if _, err := os.Stat(clientSrc); err == nil {
-			// 复用已有的 client.exe 时，--threshold / --max-total / --collect 无处可施：
-			// 内嵌块已经定死在那个二进制里了。这种情况必须报错而不是忽略——
-			// 忽略的后果是"你以为阈值改了，盘上跑的其实还是旧的"，
-			// 而这种偏差要等到整盘被跳过、或上传撞上体积上限才会暴露出来。
-			if opt.Threshold != "" || opt.MaxTotal != "" || opt.Collect != "" {
+			// 复用已有的 client.exe 时，--threshold / --max-total / --collect / --upload
+			// 全都无处可施：内嵌块已经定死在那个二进制里了。这种情况必须报错而不是忽略——
+			// 忽略的后果是"你以为开关改了，盘上跑的其实还是旧的"，
+			// 而这种偏差要等到整盘被跳过、上传撞上体积上限、或者干脆什么都没上传
+			// 的时候才会暴露出来。
+			if opt.Threshold != "" || opt.MaxTotal != "" || opt.Collect != "" ||
+				opt.Upload || opt.NoUpload {
 				return written, fmt.Errorf(
-					"同目录已存在 %s，无法套用 --threshold / --max-total / --collect（内嵌配置已定死）\n"+
+					"同目录已存在 %s，无法套用 --threshold / --max-total / --collect / --upload（内嵌配置已定死）\n"+
 						"      要么去掉这几个开关，改用它的内嵌值；要么先把那份 client.exe 移走，\n"+
 						"      让本命令现场重新生成一个再装盘", clientSrc)
 			}
@@ -295,7 +353,6 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 			if err != nil {
 				return written, fmt.Errorf("读取公钥失败: %w", err)
 			}
-			// 凭据给了就顺手把上传打开；没给就保持"只落本地"。
 			// 内嵌的凭据名用相对名，客户端按"与自身同目录"解析。
 			build := clientgen.Options{
 				PublicKeyPEM: pubRaw,
@@ -307,8 +364,23 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 				Collect:      opt.Collect,
 				Force:        opt.Force,
 			}
-			if opt.CredentialPath != "" {
+			// 上传能力的三种来源，优先级从高到低：显式 --no-upload、
+			// 显式 --upload、以及"给了凭据就开"的旧默认。
+			//
+			// 必须把 --upload 单独拎出来：工具盘的常规形态是**不带凭据**、
+			// 由目标机器现场生成 DPAPI 凭据。若只按"有没有凭据"决定，
+			// 这种盘产出的 client.exe 会静默关着上传，而盘内 README 却写着
+			// "会自动上传到 R2"——现场表现是"跑了半天，R2 上什么都没有"。
+			switch {
+			case opt.NoUpload:
+				build.EnableUpload = false
+			case opt.Upload:
 				build.EnableUpload = true
+			default:
+				build.EnableUpload = opt.CredentialPath != ""
+			}
+			if opt.CredentialPath != "" {
+				// 内嵌的凭据名用相对名，客户端按"与自身同目录"解析。
 				build.CredentialFile = DefaultCredentialFileName
 			}
 			res, err := clientgen.Build(build)
@@ -318,6 +390,7 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 			fmt.Fprintf(out, "  [OK] %s（现场生成，%d 位公钥，上传 %v）\n",
 				relOnDisk(opt, "client.exe"), res.KeyBits, res.UploadEnabled)
 			gateThreshold, gateMaxTotal = res.ThresholdText, res.MaxTotalText
+			gateUpload = res.UploadEnabled
 			if res.Config != nil {
 				gateCollect = res.Config.Collect.Policy
 			}
@@ -342,6 +415,22 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 		}
 		fmt.Fprintf(out, "  [OK] %s（%s）\n",
 			relOnDisk(opt, DefaultCredentialFileName), protectionShort(credentialProtection(opt.CredentialPath)))
+		written++
+	}
+
+	// 2c) 凭据素材 r2.json：**不含 secret**，供目标机器现场生成 client.json。
+	//
+	// 工具盘的常规形态是"上传能力开着、盘上却刻意不带凭据"（见 --upload）。
+	// 那种形态下目标机器必须自己生成一份机器绑定的凭据，而生成需要账号/桶/端点
+	// 这些路由信息——没有这份素材，现场只能靠手抄。
+	if opt.CredTemplatePath != "" {
+		if err := checkCredentialTemplateHasNoSecret(opt.CredTemplatePath); err != nil {
+			return written, err
+		}
+		if err := copyFile(opt.CredTemplatePath, filepath.Join(base, CredentialTemplateFileName), opt.Force); err != nil {
+			return written, fmt.Errorf("写入 %s 失败: %w", CredentialTemplateFileName, err)
+		}
+		fmt.Fprintf(out, "  [OK] %s（凭据素材，已确认不含 secret）\n", relOnDisk(opt, CredentialTemplateFileName))
 		written++
 	}
 
@@ -412,6 +501,7 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 		GateMaxTotal:     gateMaxTotal,
 		GateCollect:      gateCollect,
 		GateReused:       gateFromExisting,
+		UploadEnabled:    gateUpload,
 	})
 	if err := writeFile(filepath.Join(base, "README.txt"), []byte(readme), true); err != nil {
 		return written, fmt.Errorf("写入 README.txt 失败: %w", err)
@@ -640,6 +730,12 @@ type toolkitReadmeInput struct {
 	GateCollect   string
 	// GateReused 为 true 表示 client.exe 是复用现成的，门控值本命令无从得知。
 	GateReused bool
+	// UploadEnabled 表示内嵌客户端的上传能力是否开启。
+	//
+	// 这份 README 是现场唯一的离线读物，"会不会上传"是它最要命的一句话：
+	// 写错了，现场就是"跑了半天，R2 上什么都没有"，而且全程不报错。
+	// GateReused 为 true 时此字段无意义（取值由那份现成 client.exe 决定）。
+	UploadEnabled bool
 }
 
 // toolkitReadme 生成盘内说明文件。
@@ -663,6 +759,9 @@ func toolkitReadme(in toolkitReadmeInput) string {
 	if in.HasCredential {
 		fmt.Fprintf(&b, "  client.json          R2 凭据（%s，见下方说明）\n", protectionShort(in.CredProtection))
 	}
+	if in.UploadEnabled && !in.HasCredential {
+		b.WriteString("  r2.json              凭据素材（**不含 secret**）：目标机器上用它生成 client.json\n")
+	}
 	b.WriteString("  keys/                密钥材料（见下方风险）\n")
 	b.WriteString("  .usbbackup-allow     授权标记（公钥指纹）→ 本盘被豁免，不会被采集\n\n")
 
@@ -678,14 +777,28 @@ func toolkitReadme(in toolkitReadmeInput) string {
 			fmt.Fprintf(&b, "  打包体积上限    %s\n", emptyOr(in.GateMaxTotal, "（按内置默认）"))
 			b.WriteString("                  本次**待打包**数据量超过它 → 整盘跳过\n")
 			fmt.Fprintf(&b, "  采集策略        %s\n", emptyOr(in.GateCollect, "（按内置默认）"))
-			b.WriteString("                  all = 未豁免介质一律采集；marker_only = 仅采集标记盘；off = 关闭\n\n")
+			b.WriteString("                  all = 未豁免介质一律采集；marker_only = 仅采集标记盘；off = 关闭\n")
+			if in.UploadEnabled {
+				b.WriteString("  上传到 R2       开启\n")
+				b.WriteString("                  产物除了落在本机目录，还会上传到你配置的 R2 桶\n\n")
+			} else {
+				b.WriteString("  上传到 R2       关闭\n")
+				b.WriteString("                  产物**只落本机产物目录，不会上传**。\n")
+				b.WriteString("                  要开启：重新装盘并加 --upload（或 build-client 加 --upload）。\n\n")
+			}
 		}
 	}
 
 	b.WriteString("怎么用（目标机器上）\n")
 	b.WriteString("  【强烈建议】先把工具拷到目标机的本地目录再跑，例如 C:\\backup-agent。\n")
-	b.WriteString("  直接在盘上跑有两个硬伤：install-service 会把服务绑死在盘符上（拔盘即失效），\n")
-	b.WriteString("  而且客户端会优先读盘上这份 client.json —— 它会把你在本地生成的凭据盖掉。\n")
+	if in.HasCredential {
+		b.WriteString("  直接在盘上跑有两个硬伤：install-service 会把服务绑死在盘符上（拔盘即失效），\n")
+		b.WriteString("  而且客户端会优先读盘上这份 client.json —— 它会把你在本地生成的凭据盖掉。\n")
+	} else {
+		// 盘上没有 client.json 时不能照搬上面那句：本盘只有素材（r2.json），
+		// 没有可"抢先"的凭据。写了会让人去找一个不存在的文件。
+		b.WriteString("  直接在盘上跑有一个硬伤：install-service 会把服务绑死在盘符上（拔盘即失效）。\n")
+	}
 	b.WriteString("  （U 盘只当分发介质。）\n")
 	if in.HasCredential && in.CredProtection == cred.ProtectionPassphrase {
 		b.WriteString("  0) 先让客户端能**读到凭据口令**。漏掉这一步不会报错，但上传会被跳过、\n")
@@ -699,10 +812,20 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		b.WriteString("         --cred-pass-file 是生成器与解密器的参数。）\n")
 		b.WriteString("       不想每次都给口令？见下面「关于 client.json」里的 DPAPI 做法。\n")
 	}
-	b.WriteString("  1) 插上本盘，运行 client.exe accept   ← 首次确认一次\n")
-	b.WriteString("  2) 运行 client.exe run                ← 之后静默常驻\n")
-	b.WriteString("  3) 密文产物 .usbk 会自动上传到 R2；也可以手工补传：\n")
-	b.WriteString("     usbbackup-r2.exe upload <文件>.usbk\n")
+	if in.UploadEnabled && !in.HasCredential {
+		b.WriteString("  0) 先在本机生成一份凭据——上传能力已开，但盘上**没有**凭据。\n")
+		b.WriteString("     跳过这步的现场表现是\"跑了半天，R2 上什么都没有\"，而且不报错。\n")
+		b.WriteString("     做法见本文件下面「关于 R2 凭据」一节，三步。\n")
+	}
+	b.WriteString("  1) 在本地目录里运行 client.exe accept   ← 首次确认一次\n")
+	b.WriteString("  2) 运行 client.exe run                  ← 之后静默常驻\n")
+	if in.UploadEnabled {
+		b.WriteString("  3) 密文产物 .usbk 会自动上传到 R2；也可以手工补传：\n")
+		b.WriteString("     usbbackup-r2.exe upload <文件>.usbk\n")
+	} else {
+		b.WriteString("  3) **上传是关闭的**（内嵌 upload.enabled=false）：密文产物只落在本机，\n")
+		b.WriteString("     不会上传。想上传要重新装盘并加 --upload，见上面「内嵌的门控」。\n")
+	}
 	b.WriteString("  4) 在放有私钥的机器上取回并解密：\n")
 	b.WriteString("     usbunseal-r2.exe pull --out <目录> --key keys\\usbbackup-r2.key.pem --cred client.json\n")
 	b.WriteString("     （--cred 省略时会依次找 .\\client.json 与 %LOCALAPPDATA%\\usbbackup-r2\\client.json）\n")
@@ -735,7 +858,8 @@ func toolkitReadme(in toolkitReadmeInput) string {
 			b.WriteString("    但备份本身仍然解不开——解密还需要私钥口令。\n")
 			b.WriteString("\n  不想每次都给口令？换成 DPAPI 机器绑定档即可（**每台机器少一步**）：\n")
 			b.WriteString("     把工具拷到本地目录（如 C:\\backup-agent），在那里执行\n")
-			b.WriteString("       usbkeygen-r2.exe cred --from r2.json --out client.json --scope both --force\n")
+			b.WriteString("       usbkeygen-r2.exe cred --from r2.json --out client.json --scope upload --force\n")
+			b.WriteString("     （客户端只需上传权限；解密器要另出一份 --scope both 的凭据，别共用）\n")
 			b.WriteString("     不带 --cred-pass-file / --cred-pass / --plain-file 时默认就是 DPAPI 档；\n")
 			b.WriteString("     之后不设任何环境变量，client.exe cred-check 也应能列出生效凭据。\n")
 			b.WriteString("     代价：凭据与本机绑定，重装系统/换机要重生成一份。\n")
@@ -753,6 +877,34 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		b.WriteString("  - token 请用「Object Read & Write + 仅限目标桶」，不要用 Admin 两档；\n")
 		b.WriteString("    R2 没有「只写不读」这一档，也不能把长效 token 限定到 key 前缀，\n")
 		b.WriteString("    所以这一档同时能读/覆盖/删除 —— 请给桶配**桶锁 Bucket lock rules**（R2 没有对象版本控制），并定期轮换 token。\n\n")
+	} else if in.UploadEnabled {
+		// 上传开着、盘上却没有凭据：这是工具盘的常规形态（盘只当分发介质，
+		// 凭据在目标机器上现场生成）。必须把生成步骤写清楚，否则现场只知道
+		// "上传开着"，却不知道凭据从哪来，最后表现还是"跑半天 R2 上什么都没有"。
+		b.WriteString("关于 R2 凭据（**盘上没有，要在目标机器上现场生成**）\n")
+		b.WriteString("  上传能力已开启，但凭据**故意没有随盘分发**。目标机器上的第一步就是\n")
+		b.WriteString("  生成一份**只属于这台机器**的凭据（DPAPI 机器范围档），此后不需要\n")
+		b.WriteString("  任何口令或环境变量：\n")
+		b.WriteString("    1) 把工具拷到本地目录——服务要绑本地路径，别直接在盘上跑：\n")
+		b.WriteString("         mkdir C:\\backup-agent\n")
+		b.WriteString("         xcopy <本盘>\\* C:\\backup-agent\\ /E /Y\n")
+		b.WriteString("    2) 在那里生成凭据（r2.json 只有路由信息，secret 字段是空的）：\n")
+		b.WriteString("         cd /d C:\\backup-agent\n")
+		b.WriteString("         usbkeygen-r2.exe cred --from r2.json --out client.json --scope upload\n")
+		b.WriteString("       （客户端只上传，用 --scope upload；解密器另出一份 --scope both 的凭据）\n")
+		b.WriteString("       运行时会**交互询问 Secret Access Key**（无回显），不落盘。\n")
+		b.WriteString("       注意：Secret Access Key 与「凭据口令」**不是一回事**，别把口令填进去——\n")
+		b.WriteString("       填错的症状是上传一律 403 SignatureDoesNotMatch，而不是报「口令错」。\n")
+		b.WriteString("    3) 验证：一个环境变量都不设，也应列出端点/桶/前缀：\n")
+		b.WriteString("         client.exe cred-check\n")
+		b.WriteString("     代价：凭据与本机绑定，**重装系统或换机就要重新生成一份**。\n")
+		b.WriteString("     若要跨机器复用同一份凭据，改用口令加密档（cred --cred-pass-file …），\n")
+		b.WriteString("     代价是每台机器都要让客户端拿到口令（USBBACKUP_R2_CRED_PASSPHRASE_FILE）。\n")
+		b.WriteString("  两条与保护方式无关、但要知道：\n")
+		b.WriteString("  - 客户端**只认 client.json 这一份外部文件**（config.json 与环境变量一律忽略）；\n")
+		b.WriteString("    查凭据的顺序是 client.exe 同级 → 当前目录 → %LOCALAPPDATA%\\usbbackup-r2\\；\n")
+		b.WriteString("  - token 请用「Object Read & Write + 仅限目标桶」，不要用 Admin 两档，\n")
+		b.WriteString("    并给桶配**桶锁 Bucket lock rules**（R2 没有对象版本控制），定期轮换 token。\n\n")
 	}
 	if in.HasPrivate && in.PrivateEncrypted {
 		b.WriteString("[!] 私钥风险（口令保护）\n")

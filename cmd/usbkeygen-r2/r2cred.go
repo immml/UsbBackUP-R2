@@ -28,6 +28,52 @@ import (
 // 否则现场"只拷了 client.exe"会因为找不到凭据而静默退回本地模式。
 const DefaultCredentialFileName = cred.FileName
 
+// CredentialTemplateFileName 是**凭据素材**在工具盘上的名字。
+//
+// 它与 client.json 不是一回事：素材只有账号/桶/端点/前缀这些**路由信息**，
+// secret 字段留空，作用是在目标机器上现场生成一份机器绑定的凭据
+// （`usbkeygen-r2 cred --from r2.json --out client.json`）。
+// 因此它可以安全地随盘分发——本命令也会拒绝把带 secret 的文件写进盘。
+const CredentialTemplateFileName = "r2.json"
+
+// credentialTemplateSecretFields 是素材里**必须为空**的字段。
+//
+// 只列真正敏感的：填了就是"长期凭据明文随盘分发"。
+var credentialTemplateSecretFields = []string{"secret_access_key", "session_token"}
+
+// checkCredentialTemplateHasNoSecret 拒绝把含非空 secret 的文件当素材写进盘。
+//
+// 这不是洁癖：素材是随盘分发的，而盘会插到目标机器上。把 secret 写进去
+// 等于用一块可复制的介质承载长期凭据，比"不带凭据、现场生成"还糟。
+// 宁可当场报错，也不要静默产出一块"看着能用、其实泄漏了"的盘。
+func checkCredentialTemplateHasNoSecret(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("读取凭据素材失败: %w", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("凭据素材 %s 不是合法 JSON: %w", path, err)
+	}
+	for _, f := range credentialTemplateSecretFields {
+		v, ok := m[f]
+		if !ok {
+			continue
+		}
+		s, isStr := v.(string)
+		if !isStr {
+			return fmt.Errorf("凭据素材 %s 的 %s 字段类型异常（应为字符串）", path, f)
+		}
+		if strings.TrimSpace(s) != "" {
+			return fmt.Errorf(
+				"拒绝把凭据素材 %s 写进盘：其中的 %s **非空**。\n"+
+					"      素材是随盘分发的，把长期凭据写进去等于明文随盘传播。\n"+
+					"      请把该字段清空后用 --cred-template 重试", path, f)
+		}
+	}
+	return nil
+}
+
 // r2ConfigFile 是 `--r2-config <json>` 的文件结构。
 //
 // 字段名与 Cloudflare 控制台给出的示例保持一致（下划线风格），

@@ -542,14 +542,25 @@ cd D:\backup
   --drive I: `
   --subdir backup\tools `
   --keys D:\backup\keys `
-  --cred D:\backup\client.json `
+  --upload `
+  --cred-template D:\backup\r2-template.json `
   --threshold 10GiB `
   --max-total 10GiB `
   --collect all `
   --force
 ```
 
-`--threshold` / `--max-total` / `--collect` 是**写进盘内 client.exe 的内嵌配置**。装盘时若工具目录里已有一份现成的 `client.exe`，命令会**报错**而不是忽略这几个开关——它改不动已经定死的内嵌块，而静默忽略会让你以为阈值改了、实际盘上跑的仍是旧的。
+**上传能力和"带不带凭据"是两件事**，别把它们绑死：
+
+| 想要的效果 | 给什么开关 |
+|---|---|
+| 打开上传、凭据到目标机现场生成（**推荐**，盘只当分发介质） | `--upload --cred-template r2.json` |
+| 上传 + 凭据一起进盘（目标机不想再操作一次） | `--cred client.json` |
+| 只落本地、不上传 | 都不给，或 `--no-upload` |
+
+`--threshold` / `--max-total` / `--collect` / `--upload` 都是**写进盘内 client.exe 的内嵌配置**。装盘时若工具目录里已有一份现成的 `client.exe`，命令会**报错**而不是忽略这几个开关——它改不动已经定死的内嵌块，而静默忽略会让你以为改了、实际盘上跑的仍是旧的。
+
+装完盘**顺手跑一次 `client.exe config-check`**，看它自己报的 `upload.enabled` 是不是你要的那个值。这一眼很便宜，能挡掉"跑了半天，R2 上什么都没有"这种不报错的故障。
 
 会写进盘里：
 
@@ -560,6 +571,7 @@ I:\
     ├── usbsetup-r2.exe / usbkeygen-r2.exe / usbunseal-r2.exe / usbbackup-r2.exe / usbcomp-r2.exe
     ├── client.exe
     ├── client.json                  ← --cred 给了才有
+    ├── r2.json                      ← --cred-template 给了才有（不含 secret）
     ├── keys\usbbackup-r2.pub.pem
     ├── keys\usbbackup-r2.key.pem    ← --without-private 可排除
     └── README.txt

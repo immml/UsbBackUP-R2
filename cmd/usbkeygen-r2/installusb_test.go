@@ -667,3 +667,192 @@ func TestMarkerFingerprintParsing(t *testing.T) {
 		}
 	}
 }
+
+// 盘内 README 是现场唯一的离线读物，"会不会上传"是它最要命的一句话。
+// 写错了，现场就是"跑了半天，R2 上什么都没有"，而且全程不报错。
+func TestToolkitReadmeStatesUploadOff(t *testing.T) {
+	got := toolkitReadme(toolkitReadmeInput{
+		Fingerprint: "aa bb", HasClient: true, UploadEnabled: false,
+		GateThreshold: "10GiB", GateMaxTotal: "10GiB", GateCollect: "all",
+	})
+	if !strings.Contains(got, "上传到 R2       关闭") {
+		t.Error("上传关闭时必须在门控段写明")
+	}
+	if !strings.Contains(got, "不会上传") {
+		t.Error("上传关闭时必须明说不会上传")
+	}
+	if strings.Contains(got, "会自动上传到 R2") {
+		t.Error("上传关闭时不得再声称会自动上传")
+	}
+	if !strings.Contains(got, "--upload") {
+		t.Error("上传关闭时应指出开启办法")
+	}
+}
+
+// 上传开着、盘上却没凭据（工具盘的常规形态）：必须写清凭据从哪来，
+// 否则现场只知道"上传开着"却不知道还得先生成凭据，结果一样是没上传。
+func TestToolkitReadmeGivesCredentialStepsWhenUploadWithoutCredential(t *testing.T) {
+	got := toolkitReadme(toolkitReadmeInput{
+		Fingerprint: "aa bb", HasClient: true, UploadEnabled: true,
+		HasCredential: false,
+		GateThreshold: "10GiB", GateMaxTotal: "10GiB", GateCollect: "all",
+	})
+	for _, must := range []string{
+		"会自动上传到 R2", // 上传确实开着，这句是实话
+		"r2.json",   // 素材要在盘里
+		"cred --from r2.json",
+		"cred-check",
+		"Secret Access Key",
+	} {
+		if !strings.Contains(got, must) {
+			t.Errorf("上传开启但盘上无凭据时，README 未提到 %q", must)
+		}
+	}
+	// 没凭据就不该出现"这份凭据是口令加密的"之类描述。
+	if strings.Contains(got, "关于 client.json（R2 凭据）") {
+		t.Error("盘上没有 client.json，不该写出针对它的保护方式说明")
+	}
+}
+
+// --upload 必须真的把上传打开：这是本命令唯一能表达
+// "盘不带凭据、但客户端要上传"的方式。
+func TestAssembleToolkitUploadFlagEnablesUpload(t *testing.T) {
+	_, pub, priv := writeTestKeys(t)
+	dest := t.TempDir()
+	if _, err := assembleToolkit(toolkitOptions{
+		Dest: dest, ToolDir: fakeToolDir(t),
+		PublicKeyPath: pub, PrivateKeyPath: priv,
+		WithClient: true, Force: true, Upload: true,
+	}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	got, err := embedcfg.Read(filepath.Join(dest, "client.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emb config.Config
+	if err := json.Unmarshal(got.ConfigJSON, &emb); err != nil {
+		t.Fatal(err)
+	}
+	if !emb.Upload.Enabled {
+		t.Error("--upload 没有把上传打开")
+	}
+	// --upload 不带凭据：不能把内嵌凭据名钉成盘内那个相对名
+	// （否则"配置的凭据路径"会指向一个刻意不存在的文件）。
+	// 保持默认（%LOCALAPPDATA% 下那份绝对路径），现场生成在哪个目录都能被找到。
+	if emb.Upload.CredentialFile == DefaultCredentialFileName {
+		t.Errorf("--upload 不该把凭据名钉成相对名 %q", DefaultCredentialFileName)
+	}
+}
+
+// --no-upload 必须真的关掉，且优先于"给了凭据就开"的默认。
+func TestAssembleToolkitNoUploadFlagDisablesUpload(t *testing.T) {
+	_, pub, priv := writeTestKeys(t)
+	dest := t.TempDir()
+	if _, err := assembleToolkit(toolkitOptions{
+		Dest: dest, ToolDir: fakeToolDir(t),
+		PublicKeyPath: pub, PrivateKeyPath: priv,
+		WithClient: true, Force: true, NoUpload: true,
+	}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	got, err := embedcfg.Read(filepath.Join(dest, "client.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emb config.Config
+	if err := json.Unmarshal(got.ConfigJSON, &emb); err != nil {
+		t.Fatal(err)
+	}
+	if emb.Upload.Enabled {
+		t.Error("--no-upload 没有关掉上传")
+	}
+}
+
+// 复用现成的 client.exe 时，--upload 同样无处可施，必须报错。
+// 静默忽略在这里尤其隐蔽：盘看起来做好了，实际根本不会上传。
+func TestAssembleRefusesUploadFlagWhenReusingClient(t *testing.T) {
+	_, pub, priv := writeTestKeys(t)
+	tools := fakeToolDir(t)
+	src, err := os.ReadFile(filepath.Join(tools, "usbbackup-r2.exe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tools, "client.exe"), src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err = assembleToolkit(toolkitOptions{
+		Dest: t.TempDir(), ToolDir: tools,
+		PublicKeyPath: pub, PrivateKeyPath: priv,
+		WithClient: true, Force: true, Upload: true,
+	}, io.Discard)
+	if err == nil {
+		t.Fatal("复用了 client.exe 还传 --upload，必须报错而不是忽略")
+	}
+	if !strings.Contains(err.Error(), "--upload") {
+		t.Errorf("报错应点名 --upload，实际：%v", err)
+	}
+}
+
+// 凭据素材是随盘分发的，里面**不能**有 secret——那等于长期凭据明文随盘传播。
+func TestCheckCredentialTemplateRefusesSecret(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	ok := write("ok.json", `{"account_id":"a","bucket":"b","endpoint":"https://x",
+		"region":"auto","prefix":"usb/","access_key_id":"AKID","secret_access_key":""}`)
+	if err := checkCredentialTemplateHasNoSecret(ok); err != nil {
+		t.Errorf("secret 留空的素材应当放行，实际：%v", err)
+	}
+
+	bad := write("bad.json", `{"access_key_id":"AKID","secret_access_key":"deadbeef"}`)
+	if err := checkCredentialTemplateHasNoSecret(bad); err == nil {
+		t.Error("secret 非空的素材必须拒绝写进盘")
+	}
+
+	tok := write("tok.json", `{"access_key_id":"AKID","secret_access_key":"","session_token":"xyz"}`)
+	if err := checkCredentialTemplateHasNoSecret(tok); err == nil {
+		t.Error("session_token 非空同样必须拒绝")
+	}
+
+	notJSON := write("bad.txt", `secret_access_key: deadbeef`)
+	if err := checkCredentialTemplateHasNoSecret(notJSON); err == nil {
+		t.Error("不是合法 JSON 的素材必须拒绝")
+	}
+}
+
+// 素材进了盘，就要出现在盘内清单里——现场的人只有这份 README 可看。
+func TestAssembleToolkitCopiesCredentialTemplate(t *testing.T) {
+	_, pub, priv := writeTestKeys(t)
+	dir := t.TempDir()
+	tpl := filepath.Join(dir, "r2-template.json")
+	if err := os.WriteFile(tpl, []byte(`{"account_id":"a","bucket":"usbbackup",
+		"endpoint":"https://a.r2.cloudflarestorage.com","region":"auto",
+		"prefix":"usb/","access_key_id":"AKID","secret_access_key":""}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	if _, err := assembleToolkit(toolkitOptions{
+		Dest: dest, ToolDir: fakeToolDir(t),
+		PublicKeyPath: pub, PrivateKeyPath: priv,
+		WithClient: true, Force: true, Upload: true, CredTemplatePath: tpl,
+	}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, CredentialTemplateFileName)); err != nil {
+		t.Errorf("凭据素材没有写进盘：%v", err)
+	}
+	readme, err := os.ReadFile(filepath.Join(dest, "README.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(readme), CredentialTemplateFileName) {
+		t.Error("盘内 README 的清单里应列出凭据素材")
+	}
+}
