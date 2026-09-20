@@ -683,6 +683,10 @@ func toolkitReadme(in toolkitReadmeInput) string {
 	}
 
 	b.WriteString("怎么用（目标机器上）\n")
+	b.WriteString("  【强烈建议】先把工具拷到目标机的本地目录再跑，例如 C:\\backup-agent。\n")
+	b.WriteString("  直接在盘上跑有两个硬伤：install-service 会把服务绑死在盘符上（拔盘即失效），\n")
+	b.WriteString("  而且客户端会优先读盘上这份 client.json —— 它会把你在本地生成的凭据盖掉。\n")
+	b.WriteString("  （U 盘只当分发介质。）\n")
 	if in.HasCredential && in.CredProtection == cred.ProtectionPassphrase {
 		b.WriteString("  0) 先让客户端能**读到凭据口令**。漏掉这一步不会报错，但上传会被跳过、\n")
 		b.WriteString("     产物只落在本机 —— 现场表现为\"跑了半天，R2 上什么都没有\"：\n")
@@ -693,6 +697,7 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		b.WriteString("       验证：client.exe cred-check 应能解开凭据并列出端点/桶/前缀。\n")
 		b.WriteString("       （客户端只认上面两个环境变量，**没有** --cred-pass-file 开关；\n")
 		b.WriteString("         --cred-pass-file 是生成器与解密器的参数。）\n")
+		b.WriteString("       不想每次都给口令？见下面「关于 client.json」里的 DPAPI 做法。\n")
 	}
 	b.WriteString("  1) 插上本盘，运行 client.exe accept   ← 首次确认一次\n")
 	b.WriteString("  2) 运行 client.exe run                ← 之后静默常驻\n")
@@ -728,6 +733,14 @@ func toolkitReadme(in toolkitReadmeInput) string {
 			b.WriteString("    解密器另有 --cred-pass-file，也可以写进它自己的配置文件；\n")
 			b.WriteString("  - 口令**没有写在盘上**（按设计）。盘与口令同时丢失 = R2 凭据泄漏，\n")
 			b.WriteString("    但备份本身仍然解不开——解密还需要私钥口令。\n")
+			b.WriteString("\n  不想每次都给口令？换成 DPAPI 机器绑定档即可（**每台机器少一步**）：\n")
+			b.WriteString("     把工具拷到本地目录（如 C:\\backup-agent），在那里执行\n")
+			b.WriteString("       usbkeygen-r2.exe cred --from r2.json --out client.json --scope both --force\n")
+			b.WriteString("     不带 --cred-pass-file / --cred-pass / --plain-file 时默认就是 DPAPI 档；\n")
+			b.WriteString("     之后不设任何环境变量，client.exe cred-check 也应能列出生效凭据。\n")
+			b.WriteString("     代价：凭据与本机绑定，重装系统/换机要重生成一份。\n")
+			b.WriteString("     注意：必须先把盘上这份 client.json 挪开或换目录——客户端找凭据的顺序是\n")
+			b.WriteString("     client.exe 同级 → 当前目录 → %LOCALAPPDATA%\\usbbackup-r2\\，盘上那份会抢先。\n")
 		case cred.ProtectionPlainFile:
 			b.WriteString("  [!] 它是**明文**凭据，只靠文件权限保护：\n")
 			b.WriteString("  - 读取时还需显式加 --allow-plain-cred；\n")

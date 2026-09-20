@@ -332,6 +332,16 @@ func TestToolkitReadmeTellsPassphraseCredentialApart(t *testing.T) {
 	if !strings.Contains(got, "LocalSystem") {
 		t.Error("应提醒服务模式看不见用户级变量")
 	}
+	// 在盘上直接跑有两个硬伤：服务绑死盘符、盘上凭据抢先被读到。
+	// README 是现场唯一的离线读物，必须把这条写进去。
+	if !strings.Contains(got, "本地目录") {
+		t.Error("应提醒先把工具拷到本地目录再跑（服务绑盘符 + 凭据抢先）")
+	}
+	// "不想设口令"的正解是 DPAPI 档，而不是把凭据塞进二进制。
+	// 不写出来，现场的人要么每次给口令，要么去走一条不存在的路。
+	if !strings.Contains(got, "DPAPI") || !strings.Contains(got, "不想每次都给口令") {
+		t.Error("应给出 DPAPI 机器绑定档作为免口令方案")
+	}
 }
 
 // 保护方式读不出来时必须写"未知"，不能猜一个填上。

@@ -207,8 +207,9 @@ cd D:\backup
 所以：
 
 - 在这一台电脑上生成的 DPAPI 凭据，拿到**别的电脑上解不开**（报"凭据解密失败"）。这是设计意图，不是故障。
-- **部署到哪台机器，就在哪台机器上生成一份。** 便携工具盘上的 `client.json` 也一样——换了机器就要重新生成。
+- **部署到哪台机器，就在哪台机器上生成一份。** 便携工具盘上的 `client.json` 也一样——换了机器就要重新生成。所以**推荐不往盘上放凭据**，只放一份 `r2.json`（secret 留空）当素材，到目标机上现生成。详见 §9。
 - 换机/重装系统后重新执行一次 `usbkeygen-r2 cred` 即可。
+- **DPAPI 那份不需要任何口令或环境变量**——这是"不想设环境变量"的正解。口令那份才需要 `USBBACKUP_R2_CRED_PASSPHRASE[_FILE]`。
 - **要拿去 Linux 上用的那一份必须用口令加密**（Linux 没有 DPAPI）：
 
   ```PowerShell
@@ -572,22 +573,46 @@ I:\
 
 | 保护方式 | 盘插到别的 Windows 机器上 |
 |---|---|
-| 口令加密（`--cred-pass-file` 生成） | **能直接用**，但要给客户端口令 |
-| DPAPI（默认生成） | **不能用**，必须在目标机器上重新 `usbkeygen-r2 cred` 一份 |
+| DPAPI（默认生成，`dpapi-machine`） | 只能用**在生成它的那台机器上**——所以正确姿势是到目标机上现生成一份，见下 |
+| 口令加密（`--cred-pass-file` 生成） | **能直接用**（机器无关），但要给客户端口令 → 要设环境变量 |
+| 明文（`--plain-file`） | 能直接用，但等于把 R2 访问权明文放在盘上 |
 
-口令加密那份最容易踩的坑：**漏给口令不会报错，只是上传被跳过、产物全留在本地**，现场表现是"跑了半天，R2 上什么都没有"。
+#### 推荐：不给客户端任何口令，去目标机上现生成一份 DPAPI 凭据
+
+`cred` 不带 `--cred-pass-file` / `--cred-pass` / `--plain-file` 时**默认就是 `dpapi-machine`**：凭据与本机绑定，**部署时一个环境变量都不用设**。代价是重装系统/换机要重生成。
+
+```CMD
+REM 目标机器 · CMD（先 cd 到工具所在的本地目录，例如 C:\backup-agent）
+REM 1) 先把工具从盘上拷到本地目录：服务绑的是 exe 的绝对路径，装在盘上拔盘就起不来
+REM 2) 现生成凭据：--from 给路由信息，Secret 交互输入（无回显，不落盘）
+usbkeygen-r2.exe cred --from r2.json --out client.json --scope both --force
+REM 3) 验证：不设任何环境变量也应能列出生效凭据
+client.exe cred-check
+```
+
+它走 `CRYPTPROTECT_LOCAL_MACHINE`（**机器范围**，非用户范围），所以以 LocalSystem 运行的服务也能解开——这是刻意的选择，不是疏漏。
+
+> **一个坑**：客户端找凭据的顺序是 ① `client.exe` 同级 → ② 当前工作目录 → ③ `%LOCALAPPDATA%\usbbackup-r2\`。工具盘上那份 `client.json` 只要还躺在 `client.exe` 旁边就会**盖住**本地这份，现场看着像"DPAPI 不生效"。所以**必须先把工具拷到本地目录**（这也正是 §服务安装那条要求的）。
+
+#### 备用：盘上带口令加密凭据 + 设环境变量
+
+只有在"目标机经常重装、又不想每次重生成凭据"时才选这条。最容易踩的坑：**漏给口令不会报错，只是上传被跳过、产物全留在本地**，现场表现是"跑了半天，R2 上什么都没有"。
 
 ```PowerShell
 # PowerShell（目标机器上）
 # 客户端只认这两个环境变量，它**没有** --cred-pass-file 开关
 setx USBBACKUP_R2_CRED_PASSPHRASE_FILE "C:\ProgramData\usbbackup-r2\cred.pass"
-I:\backup\tools\client.exe cred-check        # 立刻验证：应列出端点/桶/前缀
+client.exe cred-check        # 立刻验证：应列出端点/桶/前缀
 
 # 注册成服务的话，服务以 LocalSystem 运行，用户级变量它看不见
 setx /M USBBACKUP_R2_CRED_PASSPHRASE_FILE "C:\ProgramData\usbbackup-r2\cred.pass"
 ```
 
-口令文件本身要放在**盘外**、权限收紧，也不要与客户端同目录。
+口令文件本身要放在**盘外**、权限收紧，也不要与客户端同目录（同目录会让强度退回明文）。
+
+#### 为什么不做"凭据硬编码进客户端"
+
+客户端是**纯 Go 静态 exe，没有 exe 之外的密钥来源**：任何加密都得把解密密钥放进同一份文件里，`strings` 或一次内存转储就能同时拿到两样。想抬高成本只能上混淆器（garble），而那会破坏"仅标准库、可离线构建"的硬约束。更现实的问题是**轮换**：硬编码意味着换 token 要重编译 + 重新分发每台机器的客户端；独立 `client.json` 只需换一个文件。所以这条路被明确否决（决策 D-16），"不想设口令"由上面的 DPAPI 方案解决。
 
 ### 盘上放不放私钥
 
@@ -661,6 +686,8 @@ $env:USBBACKUP_R2_LOG_LEVEL = 'debug'
 - [ ] `r2-check` 全部 `[OK]`（`列表(权限范围)` 那一项不能是 WARN）
 - [ ] 私钥有离线备份，口令不在同一处
 - [ ] `client.exe` 与 `client.json` 一起部署，且**不包含私钥**
+- [ ] 工具已**拷到目标机本地目录**再装服务（不是直接在盘上跑，见 §5.4）
+- [ ] 凭据在目标机上验证通过：`client.exe cred-check`（DPAPI 档不需要环境变量）
 - [ ] `probe --drive <盘符>` 的结论符合预期
 - [ ] 工具盘的 `.usbbackup-allow` 在**盘根**
 - [ ] 完整跑通过一次「采集 → 上传 → pull → 解密还原」
