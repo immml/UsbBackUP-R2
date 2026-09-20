@@ -255,6 +255,11 @@ client.exe status
 
 > 服务模式下 `%LOCALAPPDATA%` 指向的是**系统配置目录**，不是用户目录。部署时一律用**绝对路径**，别依赖环境变量展开。
 
+> **`install-service` 会把 `binPath` 钉在你执行它的那个 `client.exe` 上**（取 `os.Executable()`，
+> 且 `start= demand`）。所以**先把工具拷到目标机的本地目录再装服务**（上面示例里的
+> `C:\backup-agent`），**不要直接在 U 盘上装**——那样服务绑死在盘符上，拔盘就起不来；
+> 凭据也会连带解析到盘上那份。**U 盘只是分发介质，盘本身不是部署位置。**
+
 #### 第五步：取回并解密（在你的机器上）
 
 ```PowerShell
@@ -467,6 +472,36 @@ setx /M USBBACKUP_R2_CRED_PASSPHRASE_FILE "C:\ProgramData\usbbackup-r2\cred.pass
 ```
 
 `--without-private` 让私钥不上盘；`--cred` 给了就会顺手打开客户端的上传能力并把凭据一起放进去。
+
+#### 4.6.2 不设环境变量的做法：在目标机上现生成一份 DPAPI 凭据
+
+嫌"每台机器都要设一个环境变量"的话，可以在**目标机上**把凭据换成机器绑定档——
+`cred` 不带 `--cred-pass-file` / `--cred-pass` / `--plain-file` 时**默认就是这一档**：
+
+```CMD
+REM 目标机器 · CMD（先 cd 到工具所在的本地目录）
+usbkeygen-r2.exe cred --from r2.json --out client.json --scope both --force
+REM r2.json 里把 secret_access_key 留空，运行时会交互询问（无回显），Secret 不落盘
+```
+
+`dpapi-machine` 走的是 `CRYPTPROTECT_LOCAL_MACHINE`，即**机器范围而非用户范围**——
+同机上**任何账户**都能解开，包括以 LocalSystem 运行的客户端服务。这不是疏漏，是刻意选的：
+生成凭据的是交互登录的管理员，跑服务的是 LocalSystem，用户范围在两者之间解不开。
+
+换好之后 `client.exe cred-check` 在**一个环境变量都不设**的情况下就能列出生效凭据（已实测）。
+
+> **有个坑必须先知道**：客户端找凭据的顺序是 **① `client.exe` 同级 → ② 当前工作目录 →
+> ③ `%LOCALAPPDATA%\usbbackup-r2\`**。所以只要**工具盘**上那份口令 `client.json` 还躺在
+> `client.exe` 旁边，它就会**盖住**你在本地目录生成的那份——现场看着像"DPAPI 不生效"，
+> 其实是压根没被读到。
+>
+> 由此两条实践约定：
+> - **把工具拷到目标机的本地目录**（如 `C:\backup-agent`）再生成凭据、装服务；
+> - **不要往工具盘上生成** DPAPI 凭据——那会把盘上那份机器无关的通用凭据换成只属于
+>   这一台机器的，盘就废了。
+
+**代价**：凭据与机器绑定，**重装系统或换机就要重生成**；口令加密那份则是机器无关的。
+选哪条，看你的目标机是"装好就不动"还是"经常重装"。
 
 ---
 
