@@ -85,7 +85,7 @@ cd D:\backup
 到 Cloudflare 控制台：
 
 1. 建一个桶（本项目的配置用 `usbbackup`）。
-2. **给桶打开版本控制**（Object Versioning）——这是配套前提，理由见下面 §1.1。
+2. **给桶加一条 `Bucket lock rules`（桶锁）**——prefix 填 `usb/`。**R2 没有对象版本控制**，桶锁才是能防删的那个，理由见 §1.1。
 3. `Manage R2 API Tokens` → `Create API Token`：
    - Permissions 选 **`Object Read & Write`**（**不要**选 Admin 两档）
    - 勾上 `Apply to specific buckets only`，只勾目标桶
@@ -109,10 +109,14 @@ R2 控制台能签发的**长效 token 只有四档**：
 
 所以必须配套两件事：
 
-1. **桶开版本控制**——这一档能覆盖和删除，版本控制让"覆盖/误删"不销毁历史版本。**不是可选项。**
+1. **给桶配 `Bucket lock rules`（桶锁）**——这一档能删对象，而桶锁是 R2 上唯一能防删的原生机制。**不是可选项。**
 2. **定期轮换 token**——换一份 `client.json` 就完事，不必重新编译客户端。
 
-别指望"凭据就算被拿到也没关系"：泄漏的凭据能读、能覆盖、能删除。加密只保护**内容**（没有私钥读不出明文），保护不了**可用性**——可用性靠版本控制。
+别指望"凭据就算被拿到也没关系"：泄漏的凭据能读、能覆盖、能删除。加密只保护**内容**（没有私钥读不出明文），保护不了**可用性**——可用性靠桶锁。
+
+> **R2 没有对象版本控制。** 网上不少文章说它"完整支持 S3 的版本控制 API"，实际不是：`PutBucketVersioning` / `GetBucketVersioning` 都在 R2 的 S3 兼容表里标为**未实现**，而那个能返回 200 的 `GetBucketVersioning` 是 2022-07-20 加的 **dummy 接口**，永远返回"从未开启"，读不出真实状态（`ListObjectVersions` 则直接 501）。所以防删只有**桶锁**这一条路。
+>
+> 控制台路径：**R2 → 选桶 → Settings → Bucket lock rules → Add rule**（prefix 填 `usb/`，保留期可选 indefinite）。桶锁**优先于 lifecycle**，且配了锁规则的桶**不能被清空**。用 API 配置需要 **Cloudflare API token（Bearer）**，不是 R2 的 S3 凭据。
 
 ---
 
@@ -682,7 +686,7 @@ $env:USBBACKUP_R2_LOG_LEVEL = 'debug'
 部署前逐条过一遍：
 
 - [ ] R2 token 是 `Object Read & Write` + **仅限目标桶**，不是 Admin 档
-- [ ] 桶已开启**版本控制**（2026-09-20 实测 `usbbackup` 桶**未开启**；README §5.2.3 有查法）
+- [ ] 桶已配 **Bucket lock rules**（prefix `usb/`）——R2 没有版本控制，桶锁是唯一兜底（README §5.1.1）
 - [ ] `r2-check` 全部 `[OK]`（`列表(权限范围)` 那一项不能是 WARN）
 - [ ] 私钥有离线备份，口令不在同一处
 - [ ] `client.exe` 与 `client.json` 一起部署，且**不包含私钥**

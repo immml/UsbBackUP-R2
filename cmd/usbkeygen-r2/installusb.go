@@ -752,7 +752,7 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		b.WriteString("  - 泄漏时的处置是「控制台吊销 token + 换一份凭据」，**不需要**重新编译客户端；\n")
 		b.WriteString("  - token 请用「Object Read & Write + 仅限目标桶」，不要用 Admin 两档；\n")
 		b.WriteString("    R2 没有「只写不读」这一档，也不能把长效 token 限定到 key 前缀，\n")
-		b.WriteString("    所以这一档同时能读/覆盖/删除 —— 请给桶开**版本控制**，并定期轮换 token。\n\n")
+		b.WriteString("    所以这一档同时能读/覆盖/删除 —— 请给桶配**桶锁 Bucket lock rules**（R2 没有对象版本控制），并定期轮换 token。\n\n")
 	}
 	if in.HasPrivate && in.PrivateEncrypted {
 		b.WriteString("[!] 私钥风险（口令保护）\n")

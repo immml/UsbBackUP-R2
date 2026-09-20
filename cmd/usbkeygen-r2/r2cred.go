@@ -61,7 +61,7 @@ type r2ConfigFile struct {
 // 关于权限的现实（别按不存在的档位去配）：R2 控制台的长效 token 只有
 // Admin Read & Write / Admin Read only / Object Read & Write / Object Read only，
 // 可限定到**桶**但不能限定到 **key 前缀**。最小可达权限是
-// 「Object Read & Write + 仅限目标桶」，配套桶版本控制 + 定期轮换。
+// 「Object Read & Write + 仅限目标桶」，配套桶锁（Bucket lock rules）+ 定期轮换。
 func cmdCred(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("cred", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -312,7 +312,7 @@ func cmdCred(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, "  2) token 请用「Object Read & Write + 仅限目标桶」，不要用 Admin 两档。")
 	fmt.Fprintln(stdout, "     R2 没有「只写不读」这一档，也不能把长效 token 限定到 key 前缀。")
-	fmt.Fprintln(stdout, "     因此这一档同时能读/覆盖/删除，必须配套：桶开**版本控制**（覆盖或误删不销毁历史版本）")
+	fmt.Fprintln(stdout, "     因此这一档同时能读/覆盖/删除，必须配套：给桶配**桶锁 Bucket lock rules**（R2 没有对象版本控制）")
 	fmt.Fprintln(stdout, "     + **定期轮换** token。要真正做到限前缀只能用临时凭据（TTL ≤ 7 天），不适合常驻客户端。")
 	fmt.Fprintf(stdout, "  3) 泄漏时的处置是「吊销 token + 重新生成 %s」——**不需要**重新编译客户端。\n",
 		filepath.Base(dest))

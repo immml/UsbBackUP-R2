@@ -211,7 +211,8 @@ func TestBannerDoesNotClaimRemovedFeatures(t *testing.T) {
 	}
 
 	// 正向：当前准入语义必须如实写出来——豁免标记与三档策略。
-	for _, must := range []string{".usbbackup-allow", "豁免", "marker_only", "off", "版本控制"} {
+	// 另需锁住"桶锁"这个正确提法：R2 没有对象版本控制，别再退回那个说法。
+	for _, must := range []string{".usbbackup-allow", "豁免", "marker_only", "off", "桶锁"} {
 		if !strings.Contains(flat, must) {
 			t.Errorf("横幅未披露当前准入语义的关键项 %q", must)
 		}

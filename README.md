@@ -557,18 +557,56 @@ R2 控制台能签发的**长效 API token 只有四档权限**：
 
 所以本项目的落地形态是 **`Object Read & Write` + 仅限目标桶**，并配套两件事：
 
-1. **给桶开启版本控制（Object Versioning）**——因为这一档能覆盖和删除，版本控制让"覆盖/误删"不销毁历史版本。**这不是可选项，是前提。**
+1. **给桶配 Bucket lock rules（桶锁）**——这一档能删除对象，而桶锁是 R2 上**唯一**能兜住"误删/恶意删"的原生机制。**这不是可选项，是前提**（做法见 §5.1.1）。
 2. **定期轮换 token**——换一份 `client.json` 就完事，不需要重新编译客户端。
 
 `r2-check` 会用 `ListBuckets` 帮你判断 token 是不是账户级：**能列举桶 = Admin 权限 = 开大了**，报 WARN。
 
-**残余风险，必须知道**：上传凭据泄漏后，持有者不仅能上传伪造对象，还能**读取已有密文、覆盖或删除对象**。前者由端到端加密兜住（没有私钥读不出明文），后者由版本控制兜住。
+**残余风险，必须知道**：上传凭据泄漏后，持有者不仅能上传伪造对象，还能**读取已有密文、覆盖或删除对象**。三点要分开看：
 
-> **版本控制状态查得出来，但部署用的那份凭据故意查不了。** 2026-09-19 实测：桶级 `Object Read & Write` 调 `GetBucketVersioning` 返回 **403**（缺 `s3:GetBucketVersioning`）；2026-09-20 换账户级 Admin 凭据后同一请求返回 **200**，响应体是空的 `<VersioningConfiguration/>` —— 即**该桶当前没有开启版本控制**。
+- **读取内容**——由端到端加密兜住（没有私钥读不出明文）；
+- **覆盖**——已被对象键设计消除（键带 UTC 时间戳，每次上传都是新键，永不重名）；
+- **删除**——**只能靠桶锁兜**，见下。
+
+#### 5.1.1 桶锁（Bucket locks）——R2 没有版本控制，这才是可用的那个
+
+> **先纠正本文件此前的错误结论。** 本文档曾写"去控制台 R2 → 桶 → Settings → Object Versioning 开启版本控制"。**那个设置项不存在——R2 不提供对象版本控制（Object Versioning）。** 2026-09-20 按官方文档核实：
 >
-> `ListObjectVersions` 在 R2 上仍是 **`501 NotImplemented`**，所以"历史上到底有没有旧版本"这一侧永远查不了，只能看当前开关。
+> - R2 的 **S3 API 兼容表**把 `PutBucketVersioning` 与 `GetBucketVersioning` 都列在**未实现的桶级操作**里（表尾标注 "Feature implementation is currently in progress"，该页更新于 2026-07-31）；
+> - R2 **发布说明 2022-07-20** 明确写了这两个接口是 **dummy implementation**——"mimic the response that a basic AWS S3 bucket will return when first created"。
 >
-> 结论：要核验就用账户级凭据临时查一次（或去控制台 R2 → 桶 → Settings → Object Versioning）；**不要把账户级凭据装到盘上**——见 §5.2.3。
+> 由此，§5.2.3 里那次"账户级凭据拿到 `200` + 空 `<VersioningConfiguration/>` ⇒ 该桶未开启版本控制"的推断**作废**：读的是那个**永远返回"从未开启"的假接口**，它反映不了任何真实状态。**正确结论不是"未开启"，而是"R2 根本没有这个功能"。** §5.2.3 的表已按此更正。
+
+R2 提供的是另一套东西——**桶锁**（官方文档 `r2/buckets/bucket-locks`，最近更新 2026-04-30）：
+
+> Bucket locks prevent the deletion and overwriting of objects in an R2 bucket for a specified period — or indefinitely.
+
+要记住的性质：
+
+| 性质 | 说明 |
+|---|---|
+| 规则形态 | `prefix` + 条件：`Age`（保留秒数）、`Indefinite`、或指定到期日。单桶最多 **1000 条**规则 |
+| 生效范围 | **同时作用于已有对象与新增对象**（不是只管新写入） |
+| 多规则冲突 | 同一 key 命中多条时，**取最严格（最长）的那条** |
+| 与生命周期 | **桶锁优先于 lifecycle**——lifecycle 想 30 天删、锁要求 90 天，就等到 90 天才删 |
+| 解除 | 规则可随时删（控制台 / Wrangler / Cloudflare API） |
+| 费用 | 文档未提额外收费 |
+| 边角 | **配了任何锁规则的桶不能被"清空"（Empty bucket）**，要清空得先把规则删光 |
+
+**为什么它对我们正好对症**：上传凭据是 `Object Read & Write`，**能删对象、但不能改桶配置**——也就是**动不了锁规则**。于是"凭据泄漏后被恶意删库"这条被堵死，而你自己走控制台仍留了后门。这正是版本控制本来要提供的那层保护。
+
+**开启步骤（控制台，推荐）**：
+
+1. Cloudflare 控制台 → **R2 object storage** → 选 `usbbackup`
+2. 切到 **Settings** 标签 → 往下找到 **Bucket lock rules** 卡片
+3. **Add rule**：填规则名、**prefix 填 `usb/`**、保留期选 `Indefinite`（或填天数）
+4. **Save changes**
+
+配置 API 走的是 **Cloudflare API token（`Authorization: Bearer`）**，**不是** R2 的 S3 凭据（`PUT /accounts/{id}/r2/buckets/{bucket}/lock`）——本项目没有这份凭据，所以这一步没法 CLI 化；用 Wrangler 的话是 `npx wrangler r2 bucket lock add`，需先 `wrangler login`。
+
+> **保留期怎么选**：`Indefinite` = 备份永不删，且必须先到控制台删规则才能清库——这才是真正的 WORM 语义；填固定天数（如 365）则到期后恢复可删，便于定期清理旧备份。**本项目建议 `Indefinite`**：盘上只有你自己的介质，留着比删掉便宜。
+>
+> **一个待实测点**：锁规则是否影响 `AbortMultipartUpload`——上传失败时我们主动中止分片，不清会留下**计费**的残留分片。官方文档只写了"桶不能被清空"，没写分片这一侧。规则配好后应实测一次（手动建一个分片上传再中止）。**未测之前不要假定它一定通过。**
 
 ### 5.2 本项目实际使用的 R2 参数
 
@@ -583,7 +621,7 @@ R2 控制台能签发的**长效 API token 只有四档权限**：
 
 对象键形态：`usb/<UTC时间戳>_<净化后的卷标>.zip.usbk`，例如 `usb/20260918T143739Z_OS.zip.usbk`。
 
-> 对象键带 UTC 时间戳，所以**每次上传都是新键**。这防的是"覆盖"，不防"删除"——一旦有凭据泄漏，历史对象是可以被删掉的。所以桶版本控制该开还是要开（见 §5.1）。
+> 对象键带 UTC 时间戳，所以**每次上传都是新键**。这防的是"覆盖"，不防"删除"——一旦有凭据泄漏，历史对象是可以被删掉的。而 R2 **没有版本控制**可以救，这一半只能靠**桶锁**兜（见 §5.1.1）。
 
 #### 5.2.1 权限面实测结论（2026-09-19）
 
@@ -598,13 +636,13 @@ R2 控制台能签发的**长效 API token 只有四档权限**：
 | 换桶写入 | ❌ 403 `AccessDenied` | 对 `usbbackup-other` 写入被拒。**2026-09-20 复核：该桶根本不存在**（账户级凭据下 `GET /usbbackup-other` → `404 NoSuchBucket`）。当时"只限一个桶"的方向结论成立，但依据是错的——403 在 S3 语义里也可能只是"没权限知道这个桶存不存在"，见 §5.2.3 |
 | `ListBuckets`（账户级） | ❌ 被拒 | 桶级凭据不能列举桶 → 不是账户级 Admin（2026-09-20 换账户级凭据复测为 **200**，见 §5.2.3） |
 | `GetBucketLocation` | ✅ 200 | 桶在 `APAC` |
-| `GetBucketVersioning` | ❌ 403 | 缺桶级 `s3:GetBucketVersioning`；2026-09-20 换账户级凭据后为 **200**，见 §5.2.3 |
-| `ListObjectVersions` | ❌ 501 `NotImplemented` | R2 未实现该接口（换账户级凭据后仍是 501） |
+| `GetBucketVersioning` | ❌ 403 | 缺桶级配置读权限；换账户级凭据后为 **200**，但那是 R2 的**假接口**，答不出真实状态（见 §5.1.1） |
+| `ListObjectVersions` | ❌ 501 `NotImplemented` | R2 未实现版本控制，此接口不存在（换账户级凭据后仍是 501） |
 
 **两点结论**：
 
-1. 这份 token 就是 R2 可达的最小档位（`Object Read & Write` + 仅限 `usbbackup` 桶）。它**能读、能覆盖、能删除**——这不是配置失误，是 R2 没有"只写不读"档位。所以桶版本控制是唯一能兜住误删/覆盖的手段。
-2. `GetBucketVersioning` 403 说明这份凭据**没有桶级配置读权限**——这是最小权限的应有之义，不是缺陷。要核验开关状态就临时用账户级凭据查一次，**查完不要把账户级凭据装盘**（§5.2.3）。
+1. 这份 token 就是 R2 可达的最小档位（`Object Read & Write` + 仅限 `usbbackup` 桶）。它**能读、能覆盖、能删除**——这不是配置失误，是 R2 没有"只写不读"档位。所以**桶锁是唯一能兜住误删的手段**（§5.1.1）。
+2. `GetBucketVersioning` 403 说明这份凭据**没有桶级配置读权限**——这是最小权限的应有之义，不是缺陷。**顺带提醒：即使临时换成账户级凭据去查，这个接口也答不出真话**（它是 dummy），别在这上面浪费时间。
 
 #### 5.2.2 端到端实测（2026-09-19，真 R2）
 
@@ -638,13 +676,13 @@ cd deploy; .\client.exe once --yes --drive X: --allow-fixed     # 上传
 | 请求 | 桶级凭据（09-19） | 账户级凭据（09-20） | 说明 |
 |---|---|---|---|
 | `ListBuckets` | ❌ 被拒 | ✅ **200** | 确认为账户级 |
-| `GetBucketVersioning` | ❌ 403 | ✅ **200** | 响应体 `<VersioningConfiguration/>` **为空** |
+| `GetBucketVersioning` | ❌ 403 | ✅ **200** | 响应体 `<VersioningConfiguration/>` 为空——**但这是 dummy 接口，无论实际如何都这么答**（§5.1.1） |
 | 换桶（`GET /usbbackup-other`） | ❌ 403 | ❌ **404 `NoSuchBucket`** | 该桶不存在；403 是"无权得知存在性" |
 | `ListObjectVersions` | ❌ 501 | ❌ 501 | R2 未实现，账户级也一样 |
 
 **三条硬结论**：
 
-1. **该桶的版本控制当前是关闭的。** `<VersioningConfiguration/>` 空元素 = 从未启用过（S3 语义：无 `<Status>` 即 null）。而对象键带时间戳只防覆盖、不防删除，凭据又有 `DeleteObject` 权限——**这一项没兜住**。这不是"待确认"，是已确认未开启。
+1. **关于版本控制，前一次结论作废。** 当时由 `200` + 空 `<VersioningConfiguration/>` 推断"该桶未开启版本控制"——**这个推断不成立**。R2 的 `GetBucketVersioning` 是 2022-07-20 加的 **dummy implementation**，按发布说明它永远"mimic the response that a basic AWS S3 bucket will return when first created"，即**不管实际情况怎样都返回空**；而 `PutBucketVersioning` 在 R2 的 S3 兼容表里根本没实现。**事实是：R2 不提供对象版本控制，"开没开"这个提法本身就没有对象。** 防误删请改用**桶锁**（§5.1.1）。
 2. **账户下只有一个桶。** `ListAllMyBucketsResult` 里只有 `usbbackup`（`CreationDate 2026-09-18T14:35:34Z`）。所以"账户级 Admin 摊开后风险很大"在本案里摊不开——但**它多出来的能力是建桶/删桶**（桶级 `Object Read & Write` 没有这一档），而"删掉唯一那个备份桶"恰好是最坏的一种结果。**所以部署用的凭据仍然应该是桶级那份，不要换成账户级。**
 3. 顺带读到的桶配置（都是 R2 默认值，无需干预，但值得记下来）：
    - **生命周期**：预置规则 `Default Multipart Abort Rule` —— 未完成的分片上传 **7 天后自动中止**。这是本项目"上传失败必须 `AbortMultipartUpload`"之外的兜底，不是替代。
@@ -860,7 +898,7 @@ export USBBACKUP_R2_CRED_PASSPHRASE_FILE=~/.config/usbbackup-r2/cred.pass   # �
 ### 部署前的检查清单
 
 - [ ] R2 token 用的是 `Object Read & Write` + 仅限目标桶，**不是** Admin 档
-- [ ] 桶已开启**版本控制**（2026-09-20 实测 `usbbackup` 桶**未开启**，见 §5.2.3）
+- [ ] 桶已配 **Bucket lock rules**（prefix `usb/`）——R2 **没有**版本控制，桶锁是唯一兜底（§5.1.1）
 - [ ] `r2-check` 通过（含权限范围检查）
 - [ ] `probe --drive <盘符>` 的判定结论符合预期
 - [ ] 私钥已离线备份，且**不在**客户端分发的目录里
