@@ -201,6 +201,7 @@ func TestBannerDoesNotClaimRemovedFeatures(t *testing.T) {
 		"回写分支",     // 不存在任何"把本机数据写进介质"的路径
 		`\backup\`, // 那是回写目标目录，已不存在
 		"自动备份文件夹",  // 同上
+		"桶锁",       // 2026-09-20 用户决定不启用桶锁，横幅不该再要求用户去配
 	} {
 		if strings.Contains(flat, banned) {
 			t.Errorf("横幅仍描述已移除的能力：%q", banned)
@@ -211,8 +212,8 @@ func TestBannerDoesNotClaimRemovedFeatures(t *testing.T) {
 	}
 
 	// 正向：当前准入语义必须如实写出来——豁免标记与三档策略。
-	// 另需锁住"桶锁"这个正确提法：R2 没有对象版本控制，别再退回那个说法。
-	for _, must := range []string{".usbbackup-allow", "豁免", "marker_only", "off", "桶锁"} {
+	// 另需锁住"R2 没有对象版本控制"这个事实：别再退回"去开版本控制"的旧说法。
+	for _, must := range []string{".usbbackup-allow", "豁免", "marker_only", "off", "对象版本控制"} {
 		if !strings.Contains(flat, must) {
 			t.Errorf("横幅未披露当前准入语义的关键项 %q", must)
 		}

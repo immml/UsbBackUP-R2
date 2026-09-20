@@ -72,7 +72,7 @@ func WithAllowPlainFile() Option {
 //
 // 这是给无人值守场景的逃生口（既没有 DPAPI 又无法在启动时提供口令）。
 // 它的安全性等于"文件权限"，调用方必须自己承担，并且应当配合
-// 受限 token + 桶锁使用（R2 不提供对象版本控制，桶锁才是防删手段）。
+// 受限 token 使用，定期轮换（R2 不提供对象版本控制，删除没有原生兜底）。
 func WithForcePlainFile() Option {
 	return func(o *options) { o.forcePlainFile = true }
 }

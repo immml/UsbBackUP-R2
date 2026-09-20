@@ -876,7 +876,8 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		b.WriteString("  - 泄漏时的处置是「控制台吊销 token + 换一份凭据」，**不需要**重新编译客户端；\n")
 		b.WriteString("  - token 请用「Object Read & Write + 仅限目标桶」，不要用 Admin 两档；\n")
 		b.WriteString("    R2 没有「只写不读」这一档，也不能把长效 token 限定到 key 前缀，\n")
-		b.WriteString("    所以这一档同时能读/覆盖/删除 —— 请给桶配**桶锁 Bucket lock rules**（R2 没有对象版本控制），并定期轮换 token。\n\n")
+		b.WriteString("    所以这一档同时能读/覆盖/删除，而 R2 没有对象版本控制 —— 删除**没有原生兜底**，\n")
+		b.WriteString("    请定期轮换 token，并自行评估远端对象被删除的风险。\n\n")
 	} else if in.UploadEnabled {
 		// 上传开着、盘上却没有凭据：这是工具盘的常规形态（盘只当分发介质，
 		// 凭据在目标机器上现场生成）。必须把生成步骤写清楚，否则现场只知道
@@ -904,7 +905,7 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		b.WriteString("  - 客户端**只认 client.json 这一份外部文件**（config.json 与环境变量一律忽略）；\n")
 		b.WriteString("    查凭据的顺序是 client.exe 同级 → 当前目录 → %LOCALAPPDATA%\\usbbackup-r2\\；\n")
 		b.WriteString("  - token 请用「Object Read & Write + 仅限目标桶」，不要用 Admin 两档，\n")
-		b.WriteString("    并给桶配**桶锁 Bucket lock rules**（R2 没有对象版本控制），定期轮换 token。\n\n")
+		b.WriteString("    并定期轮换；R2 没有对象版本控制，删除**没有原生兜底**。\n\n")
 	}
 	if in.HasPrivate && in.PrivateEncrypted {
 		b.WriteString("[!] 私钥风险（口令保护）\n")
