@@ -499,7 +499,11 @@ R2 控制台能签发的**长效 API token 只有四档权限**：
 
 **残余风险，必须知道**：上传凭据泄漏后，持有者不仅能上传伪造对象，还能**读取已有密文、覆盖或删除对象**。前者由端到端加密兜住（没有私钥读不出明文），后者由版本控制兜住。
 
-> **无法自动核验版本控制状态。** 2026-09-19 实测：`GetBucketVersioning` 需要**桶级**权限（`Object Read & Write` 没有，返回 403），而 `ListObjectVersions` 在 R2 上直接是 `501 NotImplemented`。所以"桶版本控制开没开"**只能去 Cloudflare 控制台（R2 → 桶 → Settings → Object Versioning）自己确认**，任何工具都替代不了这一步。
+> **版本控制状态查得出来，但部署用的那份凭据故意查不了。** 2026-09-19 实测：桶级 `Object Read & Write` 调 `GetBucketVersioning` 返回 **403**（缺 `s3:GetBucketVersioning`）；2026-09-20 换账户级 Admin 凭据后同一请求返回 **200**，响应体是空的 `<VersioningConfiguration/>` —— 即**该桶当前没有开启版本控制**。
+>
+> `ListObjectVersions` 在 R2 上仍是 **`501 NotImplemented`**，所以"历史上到底有没有旧版本"这一侧永远查不了，只能看当前开关。
+>
+> 结论：要核验就用账户级凭据临时查一次（或去控制台 R2 → 桶 → Settings → Object Versioning）；**不要把账户级凭据装到盘上**——见 §5.2.3。
 
 ### 5.2 本项目实际使用的 R2 参数
 
@@ -526,16 +530,16 @@ R2 控制台能签发的**长效 API token 只有四档权限**：
 | `HeadObject` / `GetObject` | ✅ 允许 | 大小核对一致 |
 | `ListObjectsV2` | ✅ 允许 | `usbunseal-r2 ls` 正常工作 |
 | `DeleteObject` | ✅ 允许 | `r2-check` 的探活对象被成功清理 |
-| 换桶写入 | ❌ 403 `AccessDenied` | 对 `usbbackup-other` 写入被拒 → **token 确实只限这一个桶** |
-| `ListBuckets`（账户级） | ❌ 被拒 | 不是账户级 Admin 权限 |
+| 换桶写入 | ❌ 403 `AccessDenied` | 对 `usbbackup-other` 写入被拒。**2026-09-20 复核：该桶根本不存在**（账户级凭据下 `GET /usbbackup-other` → `404 NoSuchBucket`）。当时"只限一个桶"的方向结论成立，但依据是错的——403 在 S3 语义里也可能只是"没权限知道这个桶存不存在"，见 §5.2.3 |
+| `ListBuckets`（账户级） | ❌ 被拒 | 桶级凭据不能列举桶 → 不是账户级 Admin（2026-09-20 换账户级凭据复测为 **200**，见 §5.2.3） |
 | `GetBucketLocation` | ✅ 200 | 桶在 `APAC` |
-| `GetBucketVersioning` | ❌ 403 | 需要**桶级**权限，这份 token 没有 |
-| `ListObjectVersions` | ❌ 501 `NotImplemented` | R2 未实现该接口 |
+| `GetBucketVersioning` | ❌ 403 | 缺桶级 `s3:GetBucketVersioning`；2026-09-20 换账户级凭据后为 **200**，见 §5.2.3 |
+| `ListObjectVersions` | ❌ 501 `NotImplemented` | R2 未实现该接口（换账户级凭据后仍是 501） |
 
 **两点结论**：
 
 1. 这份 token 就是 R2 可达的最小档位（`Object Read & Write` + 仅限 `usbbackup` 桶）。它**能读、能覆盖、能删除**——这不是配置失误，是 R2 没有"只写不读"档位。所以桶版本控制是唯一能兜住误删/覆盖的手段。
-2. **版本控制是否开启，用这份 token 查不出来**（上面两条路都走不通），必须去 Cloudflare 控制台确认。在确认之前，不要把重要介质的唯一副本托付给它。
+2. `GetBucketVersioning` 403 说明这份凭据**没有桶级配置读权限**——这是最小权限的应有之义，不是缺陷。要核验开关状态就临时用账户级凭据查一次，**查完不要把账户级凭据装盘**（§5.2.3）。
 
 #### 5.2.2 端到端实测（2026-09-19，真 R2）
 
@@ -560,6 +564,28 @@ cd deploy; .\client.exe once --yes --drive X: --allow-fixed     # 上传
 | 第二次上传 | 新键 `…T133509Z…`，**不覆盖**上一次，`pull --all` 两份都能取回 |
 
 凭据在 Windows 客户端侧走 DPAPI、在解密器侧走口令加密，**同一把 token 出两份凭据**——这正是 §6 那张表要说明的用法。
+
+#### 5.2.3 账户级凭据下的权限面复核（2026-09-20）
+
+2026-09-19 那份是**桶级** `Object Read & Write`。2026-09-20 换用**账户级 Admin Read & Write**
+（仅用于核验窗口，不装盘）重打同样一组只读请求，差异如下：
+
+| 请求 | 桶级凭据（09-19） | 账户级凭据（09-20） | 说明 |
+|---|---|---|---|
+| `ListBuckets` | ❌ 被拒 | ✅ **200** | 确认为账户级 |
+| `GetBucketVersioning` | ❌ 403 | ✅ **200** | 响应体 `<VersioningConfiguration/>` **为空** |
+| 换桶（`GET /usbbackup-other`） | ❌ 403 | ❌ **404 `NoSuchBucket`** | 该桶不存在；403 是"无权得知存在性" |
+| `ListObjectVersions` | ❌ 501 | ❌ 501 | R2 未实现，账户级也一样 |
+
+**三条硬结论**：
+
+1. **该桶的版本控制当前是关闭的。** `<VersioningConfiguration/>` 空元素 = 从未启用过（S3 语义：无 `<Status>` 即 null）。而对象键带时间戳只防覆盖、不防删除，凭据又有 `DeleteObject` 权限——**这一项没兜住**。这不是"待确认"，是已确认未开启。
+2. **账户下只有一个桶。** `ListAllMyBucketsResult` 里只有 `usbbackup`（`CreationDate 2026-09-18T14:35:34Z`）。所以"账户级 Admin 摊开后风险很大"在本案里摊不开——但**它多出来的能力是建桶/删桶**（桶级 `Object Read & Write` 没有这一档），而"删掉唯一那个备份桶"恰好是最坏的一种结果。**所以部署用的凭据仍然应该是桶级那份，不要换成账户级。**
+3. 顺带读到的桶配置（都是 R2 默认值，无需干预，但值得记下来）：
+   - **生命周期**：预置规则 `Default Multipart Abort Rule` —— 未完成的分片上传 **7 天后自动中止**。这是本项目"上传失败必须 `AbortMultipartUpload`"之外的兜底，不是替代。
+   - **服务端加密**：`SSEAlgorithm=AES256`，`BucketKeyEnabled=true`（R2 默认开启静态加密）。
+   - **ACL**：仅 owner 一条 `FULL_CONTROL`。
+   - **位置**：`APAC`。
 
 
 把上面这些填成一份 `r2.json`，之后所有 `cred` 命令都可以用 `--from r2.json` 一次带全（`secret_access_key` 留空则仍会交互询问，推荐就这么留）：
@@ -769,7 +795,7 @@ export USBBACKUP_R2_CRED_PASSPHRASE_FILE=~/.config/usbbackup-r2/cred.pass   # �
 ### 部署前的检查清单
 
 - [ ] R2 token 用的是 `Object Read & Write` + 仅限目标桶，**不是** Admin 档
-- [ ] 桶已开启**版本控制**
+- [ ] 桶已开启**版本控制**（2026-09-20 实测 `usbbackup` 桶**未开启**，见 §5.2.3）
 - [ ] `r2-check` 通过（含权限范围检查）
 - [ ] `probe --drive <盘符>` 的判定结论符合预期
 - [ ] 私钥已离线备份，且**不在**客户端分发的目录里

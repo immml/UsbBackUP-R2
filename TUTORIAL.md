@@ -653,7 +653,7 @@ $env:USBBACKUP_R2_LOG_LEVEL = 'debug'
 部署前逐条过一遍：
 
 - [ ] R2 token 是 `Object Read & Write` + **仅限目标桶**，不是 Admin 档
-- [ ] 桶已开启**版本控制**
+- [ ] 桶已开启**版本控制**（2026-09-20 实测 `usbbackup` 桶**未开启**；README §5.2.3 有查法）
 - [ ] `r2-check` 全部 `[OK]`（`列表(权限范围)` 那一项不能是 WARN）
 - [ ] 私钥有离线备份，口令不在同一处
 - [ ] `client.exe` 与 `client.json` 一起部署，且**不包含私钥**
