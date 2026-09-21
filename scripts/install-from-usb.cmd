@@ -126,6 +126,9 @@ for %%A in (%*) do (
     )
 )
 set "DST=%DST_ROOT%\%APP_NAME%"
+REM Wording used by the DRYRUN plan for the robocopy step.
+set "RCNOTE=merge into the existing target"
+if defined CLEAN set "RCNOTE=fresh copy"
 
 echo ===========================================================================
 echo    usbbackup-r2  -  one-click installer
@@ -420,14 +423,14 @@ REM ===========================================================================
 echo [DRYRUN] would run:
 if defined UNDO goto :dryrun_undo_list
 echo    1. sc stop %SVC_NAME%  then  sc delete %SVC_NAME%     (if registered)
+if not defined CLEAN echo    2. no /CLEAN: keep the existing target, client.json included
 if defined CLEAN echo    2. /CLEAN: strip the deny ACE on "%HARDEN_DIR%"  then  rmdir /s /q "%DST%"
-if defined CLEAN echo    3. robocopy "%SRC%" "%DST%" /E /COPY:DAT   (fresh copy)
-if not defined CLEAN echo    2. robocopy "%SRC%" "%DST%" /E /COPY:DAT   (target kept, client.json preserved)
+echo    3. robocopy "%SRC%" "%DST%" /E /COPY:DAT   (!RCNOTE!)
 echo    4. verify every file: name + size
 if defined NOAUTH echo    5. SKIP the credential step (/NOAUTH)
 if not defined NOAUTH echo    5. create %DST%\%CRED_FILE% from %CRED_TEMPLATE% (asks for the Secret once)
 echo    6. client.exe accept --yes
-echo    7. cd /d "%DST%"  &&  client.exe install-service
+echo    7. cd /d "%DST%"  then  client.exe install-service
 echo    8. sc config %SVC_NAME% start= auto                   (auto-start)
 echo    9. sc failure %SVC_NAME% reset= %FAILURE_RESET% actions= %FAILURE_ACTIONS%
 echo   10. sc start %SVC_NAME%
