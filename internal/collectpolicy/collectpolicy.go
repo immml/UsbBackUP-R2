@@ -23,15 +23,22 @@
 // 卷序列号降级为**审计字段**：它擅长的是事后对账（"那次上传是哪块盘"），
 // 不擅长事前唯一识别。
 //
-// # 两个标记，语义相反，都要有
+// # 三个标记文件
 //
-//	授权标记 .usbbackup-allow   "这块盘是我自己的，别动它" → **豁免**，绝不采集
-//	采集标记 .usbbackup-collect "这块盘的内容可以打包上传" → 仅供 marker_only 档位使用
+//	授权标记·卷级   .usbbackup-allow       "这个卷是我自己的，别动它"   → 豁免该卷
+//	授权标记·磁盘级 .usbbackup-allow-disk  "这支盘是我自己的，别动它"   → 同物理磁盘所有卷一起豁免
+//	采集标记        .usbbackup-collect     "这个卷的内容可以打包上传"   → 仅供 marker_only 档位使用
 //
-// 授权标记的判定**不受策略档位影响**，任何档位下都先做这一步。原因很实际：
-// 工具盘上放着私钥（或带口令的私钥文件），一旦被采集打包上传到对象存储，
-// 等于把私钥发布到了网上——这是本项目最不能出的事故，
-// 因此不允许"因为策略是 all 所以跳过豁免检查"这种组合出现。
+// 为什么授权标记要分两级：**卷**与**盘**在多分区介质上不是一回事。
+// 卷级判定读的是 `<卷根>\.usbbackup-allow`，而使用者的心智模型是"这支 U 盘"。
+// 一支 Ventoy 盘至少两个分区（数据区 + VTOYEFI），标记只落在数据区，
+// 客户端扫到 VTOYEFI 分区时认定"没标记"→ 照常打包上传，
+// 于是出现"我明明标记过它"却被部分采集的情形（2026-09-20 部署实测踩到）。
+//
+// 判定顺序固定：**卷级 → 磁盘级 → 策略档位**，前两级都不受档位影响。
+// 授权标记的判定之所以必须无条件先做，理由很实际：工具盘上放着私钥
+// （或带口令的私钥文件），一旦被采集打包上传到对象存储，等于把私钥发布到了网上
+// ——这是本项目最不能出的事故，因此不允许"因为策略是 all 所以跳过豁免检查"这种组合出现。
 //
 // # 三档策略
 //
@@ -74,12 +81,29 @@ const (
 // 那正好是使用者最不想要的组合。
 const DefaultMarkerFile = ".usbbackup-collect"
 
-// DefaultExemptMarkerFile 是**授权标记**的默认文件名。
+// DefaultExemptMarkerFile 是**授权标记（卷级）**的默认文件名。
 //
 // 这个名字与不含出站能力的版本（项目 A）**完全一致**，两边的盘可以互相认：
 // 项目 A 的工具盘根上就有这个文件，本项目读到它就知道"这是自己人的盘，
 // 里面还有私钥，绝不能打包上传"。
+//
+// 语义始终是**卷级**的（只豁免写了它的那个卷根）——项目 A 也按这个语义判定，
+// 改它等于让两边的判定悄悄分叉。要表达"整支盘"请用磁盘级标记。
 const DefaultExemptMarkerFile = ".usbbackup-allow"
+
+// DefaultExemptDiskMarkerFile 是**授权标记（磁盘级）**的默认文件名。
+//
+// 作用域跨卷：**只要同一物理磁盘上的任意一个卷根带着它，该磁盘上所有卷一起豁免**。
+//
+// 新增一个文件名而不是把 `.usbbackup-allow` 升级成磁盘级语义，是为了让
+// "我想豁免哪一个层级"这件事在介质上**显式可见**：
+//
+//	只放 .usbbackup-allow        → 豁免这个卷
+//	再放一个 .usbbackup-allow-disk → 豁免整支盘（含盘上其它分区）
+//
+// 代价是多一个文件；收益是使用者不必理解"物理磁盘号"这种东西，
+// 也不会因为两个项目的同名文件被赋予不同语义而互相踩到。
+const DefaultExemptDiskMarkerFile = ".usbbackup-allow-disk"
 
 // 跳过原因（写入审计，便于事后复盘）。
 const (
@@ -87,8 +111,10 @@ const (
 	ReasonDisabled = "collect-disabled"
 	// ReasonMarkerAbsent 表示 marker_only 档位下未找到采集标记。
 	ReasonMarkerAbsent = "collect-marker-absent"
-	// ReasonExempt 表示盘根存在授权标记，本次直接豁免。
+	// ReasonExempt 表示卷根存在卷级授权标记，本次直接豁免。
 	ReasonExempt = "exempt-marker-present"
+	// ReasonExemptDisk 表示同物理磁盘上的某个卷根存在磁盘级授权标记，整盘豁免。
+	ReasonExemptDisk = "exempt-disk-marker-present"
 )
 
 // Options 是一次判定的输入。
@@ -97,8 +123,18 @@ type Options struct {
 	Policy Policy
 	// Marker 是采集标记文件名；空则用 DefaultMarkerFile。
 	Marker string
-	// ExemptMarker 是授权标记文件名；空则用 DefaultExemptMarkerFile。
+	// ExemptMarker 是卷级授权标记文件名；空则用 DefaultExemptMarkerFile。
 	ExemptMarker string
+	// ExemptDiskMarker 是磁盘级授权标记文件名；空则用 DefaultExemptDiskMarkerFile。
+	//
+	// 仅在 SameDiskRoots 非 nil 时参与判定。
+	ExemptDiskMarker string
+	// SameDiskRoots 返回与给定卷根同属一块物理磁盘的所有卷根（**含自身**）。
+	//
+	// 由调用方注入（Windows 上即 winvol.SameDiskRoots）。这样做是为了让本包
+	// 保持纯文件系统层面、可用假函数测全部分支；而"查磁盘号需要管理员权限"
+	// 这类平台差异留在 winvol 里。置 nil 表示本平台不做磁盘级判定。
+	SameDiskRoots func(root string) ([]string, error)
 }
 
 // Decision 是一次判定结论。
@@ -107,9 +143,20 @@ type Decision struct {
 	Collect bool
 	// Reason 在拒绝时有值，描述拒绝原因（可直接写入审计）。
 	Reason string
-	// ExemptMarkerChecked / ExemptMarkerFound 描述授权标记的检查情况。
+	// ExemptMarkerChecked / ExemptMarkerFound 描述卷级授权标记的检查情况。
 	ExemptMarkerChecked bool
 	ExemptMarkerFound   bool
+	// ExemptDiskMarkerChecked / ExemptDiskMarkerFound 描述磁盘级授权标记的检查情况。
+	ExemptDiskMarkerChecked bool
+	ExemptDiskMarkerFound   bool
+	// ExemptDiskMarkerRoot 记录是在哪个卷根上发现磁盘级标记的（空表示未命中）。
+	// 带上它是为了审计时能回答"凭什么说这块盘是自家人"。
+	ExemptDiskMarkerRoot string
+	// ExemptDiskCheckErr 非空表示**磁盘级检查没做完**（例如缺少卷句柄权限）。
+	//
+	// 这不是判定失败，不影响 Collect；但调用方必须把它当告警看待：
+	// 此刻只剩卷级判定在起作用，多分区介质仍可能出现"标记过却被部分采集"。
+	ExemptDiskCheckErr string
 	// MarkerChecked 表示本次是否真的去看过采集标记文件。
 	MarkerChecked bool
 	// MarkerFound 表示采集标记是否存在。
@@ -153,8 +200,9 @@ func ValidMarkerName(name string) error {
 //
 // 判定顺序是固定的，不能交换：
 //
-//  1. 授权标记豁免（**与策略无关**，任何档位都先做）；
-//  2. 策略档位（off 关闭 / all 放行 / marker_only 看采集标记）。
+//  1. 卷级授权标记豁免（**与策略无关**，任何档位都先做）；
+//  2. 磁盘级授权标记豁免（同上，仅当调用方提供了 SameDiskRoots）；
+//  3. 策略档位（off 关闭 / all 放行 / marker_only 看采集标记）。
 //
 // 只读操作：除各 `Stat` 一次标记文件外，不打开任何文件。
 func Decide(root string, opt Options) (Decision, error) {
@@ -171,6 +219,24 @@ func Decide(root string, opt Options) (Decision, error) {
 	if exempt {
 		d.Reason = ReasonExempt
 		return d, nil
+	}
+
+	// 磁盘级豁免：这块物理磁盘上**任意一个**卷根带着磁盘级标记，整盘放过。
+	if opt.SameDiskRoots != nil {
+		found, where, derr := diskMarkerPresent(root, opt.ExemptDiskMarker, DefaultExemptDiskMarkerFile, opt.SameDiskRoots)
+		d.ExemptDiskMarkerChecked = true
+		switch {
+		case derr != nil:
+			// 查不到磁盘归属（通常是权限不足）**不改变采集结论**——磁盘级标记是加固，
+			// 不是准入前提，因此不能因此拒绝一块本来该备份的盘。
+			// 但要把原因带出去让上层告警：否则使用者会误以为整支盘都豁免了。
+			d.ExemptDiskCheckErr = derr.Error()
+		case found:
+			d.ExemptDiskMarkerFound = true
+			d.ExemptDiskMarkerRoot = where
+			d.Reason = ReasonExemptDisk
+			return d, nil
+		}
 	}
 
 	switch p {
@@ -221,6 +287,32 @@ func markerPresent(root, name, fallback string) (bool, error) {
 		return false, nil
 	}
 	return !st.IsDir(), nil
+}
+
+// diskMarkerPresent 在同物理磁盘的各卷根上查找磁盘级授权标记。
+//
+// 命中时返回命中的那个卷根（`where`），供审计回答"凭什么说这块盘是自家人"。
+// 与卷级判定同理，这里也只 `Stat` 存在性、不读内容。
+//
+// 注意入参 root 本身也在查询结果里（SameDiskRoots 的约定是含自身），
+// 于是"标记就写在当前这个卷上"这种情况天然被覆盖，不需要额外分支。
+func diskMarkerPresent(root, name, fallback string,
+	sameDiskRoots func(string) ([]string, error)) (bool, string, error) {
+
+	roots, err := sameDiskRoots(root)
+	if err != nil {
+		return false, "", err
+	}
+	for _, r := range roots {
+		ok, err := markerPresent(r, name, fallback)
+		if err != nil {
+			return false, "", err
+		}
+		if ok {
+			return true, r, nil
+		}
+	}
+	return false, "", nil
 }
 
 // Describe 返回一句人话，用于启动日志与诊断输出。

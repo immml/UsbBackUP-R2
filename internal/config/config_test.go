@@ -24,6 +24,11 @@ func TestDefaultIsValid(t *testing.T) {
 	if c.Collect.ExemptMarkerFile != ".usbbackup-allow" {
 		t.Fatalf("授权标记默认应为 .usbbackup-allow（与不含出站能力的版本同名），实际 %q", c.Collect.ExemptMarkerFile)
 	}
+	// 磁盘级标记是**另一个**文件名：卷级与磁盘级语义不同，默认值合并就等于
+	// 再也表达不出"豁免一个卷"与"豁免整支盘"的区别。
+	if c.Collect.ExemptDiskMarkerFile != ".usbbackup-allow-disk" {
+		t.Fatalf("磁盘级授权标记默认应为 .usbbackup-allow-disk，实际 %q", c.Collect.ExemptDiskMarkerFile)
+	}
 	if c.Collect.Policy != "all" {
 		t.Fatalf("采集策略默认应为 all，实际 %q", c.Collect.Policy)
 	}
@@ -142,12 +147,19 @@ func TestValidateRejectsMarkerWithSeparator(t *testing.T) {
 
 func TestValidateRejectsBadValues(t *testing.T) {
 	mutators := map[string]func(*Config){
-		"轮询间隔为 0":    func(c *Config) { c.Monitor.PollIntervalSec = 0 },
-		"超时为 0":      func(c *Config) { c.Monitor.JobTimeoutMin = 0 },
-		"阈值负数":       func(c *Config) { c.Gate.UsedThresholdBytes = -1 },
-		"采集策略非法":     func(c *Config) { c.Collect.Policy = "whatever" },
-		"采集标记带分隔符":   func(c *Config) { c.Collect.MarkerFile = `a\b` },
-		"授权标记带分隔符":   func(c *Config) { c.Collect.ExemptMarkerFile = "a/b" },
+		"轮询间隔为 0":   func(c *Config) { c.Monitor.PollIntervalSec = 0 },
+		"超时为 0":     func(c *Config) { c.Monitor.JobTimeoutMin = 0 },
+		"阈值负数":      func(c *Config) { c.Gate.UsedThresholdBytes = -1 },
+		"采集策略非法":    func(c *Config) { c.Collect.Policy = "whatever" },
+		"采集标记带分隔符":  func(c *Config) { c.Collect.MarkerFile = `a\b` },
+		"授权标记带分隔符":  func(c *Config) { c.Collect.ExemptMarkerFile = "a/b" },
+		"磁盘级标记带分隔符": func(c *Config) { c.Collect.ExemptDiskMarkerFile = "a/b" },
+		"磁盘级与卷级标记同名": func(c *Config) {
+			c.Collect.ExemptDiskMarkerFile = c.Collect.ExemptMarkerFile
+		},
+		"磁盘级标记与采集标记同名": func(c *Config) {
+			c.Collect.ExemptDiskMarkerFile = c.Collect.MarkerFile
+		},
 		"上传分片过小":     func(c *Config) { c.Upload.PartSizeBytes = 1 << 10 },
 		"开启上传但无凭据路径": func(c *Config) { c.Upload.Enabled = true; c.Upload.CredentialFile = "  " },
 		"保留份数为 0":    func(c *Config) { c.Retention.KeepPerVolume = 0 },

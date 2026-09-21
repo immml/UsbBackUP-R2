@@ -165,6 +165,47 @@ func TestAllowMarkerExemptsToolkitFromCollection(t *testing.T) {
 	}
 }
 
+// 装盘必须在盘根同时写出两个授权标记，且磁盘级那份能救下**同盘的其它分区**——
+// 那正是 2026-09-20 部署实测踩到的场景（Ventoy 盘的 VTOYEFI 分区被整盘采集）。
+func TestAssembleToolkitWritesBothExemptionMarkers(t *testing.T) {
+	_, pub, priv := writeTestKeys(t)
+	dest := t.TempDir()
+	if _, err := assembleToolkit(toolkitOptions{
+		Dest: dest, ToolDir: fakeToolDir(t),
+		PublicKeyPath: pub, PrivateKeyPath: priv, Force: true,
+	}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		collectpolicy.DefaultExemptMarkerFile,
+		collectpolicy.DefaultExemptDiskMarkerFile,
+	} {
+		if _, err := os.Stat(filepath.Join(dest, name)); err != nil {
+			t.Fatalf("装盘未写出 %s：%v", name, err)
+		}
+	}
+
+	// 模拟同一支盘上的另一个分区：它自己没有任何标记。
+	otherPart := t.TempDir()
+	if err := os.WriteFile(filepath.Join(otherPart, "EFI.BIN"), []byte("EFI"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err := collectpolicy.Decide(otherPart, collectpolicy.Options{
+		Policy: collectpolicy.PolicyAll,
+		// 注入"这两个卷根同属一块物理磁盘"——真机上由 winvol 查磁盘号得到。
+		SameDiskRoots: func(string) ([]string, error) { return []string{dest, otherPart}, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Collect || d.Reason != collectpolicy.ReasonExemptDisk {
+		t.Fatalf("同盘的另一个分区没被磁盘级标记救下：%+v", d)
+	}
+	if d.ExemptDiskMarkerRoot != dest {
+		t.Errorf("命中卷根应为 %s，实际 %q", dest, d.ExemptDiskMarkerRoot)
+	}
+}
+
 func TestAssembleWithoutPrivateOmitsKey(t *testing.T) {
 	_, pub, priv := writeTestKeys(t)
 	dest := t.TempDir()
@@ -640,6 +681,69 @@ func TestMergeExemptMarkerCreatesWhenAbsent(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "fingerprint=aa bb") {
 		t.Errorf("新标记内容不符：\n%s", raw)
+	}
+}
+
+// 磁盘级授权标记走的是同一套"只追加、幂等"的实现，但文件里的说明文字必须
+// 与卷级那份区分开：现场的人靠注释判断哪一个管"整支盘"，两行都写"本盘被豁免"
+// 就等于没写。
+func TestMergeExemptDiskMarkerIsAppendAndIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".usbbackup-allow-disk")
+
+	action, err := mergeExemptDiskMarker(path, "aa bb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "新建" {
+		t.Errorf("首次写入应走新建分支，实际 %q", action)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "fingerprint=aa bb") {
+		t.Fatalf("新标记内容不符：\n%s", text)
+	}
+	if !strings.Contains(text, "磁盘级") {
+		t.Fatalf("标记文件里必须写明它是磁盘级的：\n%s", text)
+	}
+
+	// 追加：另一个项目（或上一次装盘）留下的指纹不能被冲掉。
+	before := text
+	action, err = mergeExemptDiskMarker(path, "cc dd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "追加" {
+		t.Errorf("应走追加分支，实际 %q", action)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text = string(raw)
+	if !strings.Contains(text, before) {
+		t.Fatalf("原有内容被覆盖了：\n%s", text)
+	}
+	if !strings.Contains(text, "fingerprint=cc dd") {
+		t.Fatalf("新指纹没写进去：\n%s", text)
+	}
+
+	// 幂等：重复装盘不该越写越长。
+	again, err := mergeExemptDiskMarker(path, "cc dd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != "已含相同指纹，未改动" {
+		t.Errorf("重复装盘应识别为已存在，实际 %q", again)
+	}
+	raw2, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw2) != text {
+		t.Error("重复装盘改动了标记文件的内容")
 	}
 }
 

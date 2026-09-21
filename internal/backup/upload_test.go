@@ -816,6 +816,97 @@ func TestRunSkipsBeforeAnyUploadAttemptOnExemptVolume(t *testing.T) {
 	}
 }
 
+// 复现多分区介质的真实情形（2026-09-20 部署实测踩到的那次）：
+// 本次作业的卷**自己没有任何标记**，但同一块物理磁盘上的另一个卷根带着磁盘级标记
+// —— 比如 Ventoy 盘的固件分区 vs 数据分区。必须整盘豁免，且豁免发生在任何打包动作之前。
+func TestRunSkipsWhenSiblingVolumeCarriesDiskMarker(t *testing.T) {
+	jobRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(jobRoot, "firmware.bin"), []byte("EFI PART"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	markerRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(markerRoot, ".usbbackup-allow-disk"),
+		[]byte("fingerprint=x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	drive, cleanup := substDrive(t, jobRoot)
+	if drive == "" {
+		t.Skip("本机无法用 subst 造卷，跳过")
+	}
+	defer cleanup()
+
+	keyDir := t.TempDir()
+	kp, err := keystore.Generate(keystore.GenerateOptions{Bits: 2048, OutDir: keyDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := keystore.LoadPublicKey(kp.PublicPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outDir := t.TempDir()
+	auditFile := filepath.Join(t.TempDir(), "audit.jsonl")
+	stub := &stubUploader{}
+	cfg := config.Default()
+	cfg.OutputDir = outDir
+	cfg.AuditFile = auditFile
+	cfg.PublicKeyPath = kp.PublicPath
+	cfg.Gate.UsedThresholdBytes = 1 << 62
+	cfg.Gate.MaxTotalBytes = 0
+	cfg.Upload.Enabled = true
+	cfg.Collect.Policy = "all" // 哪怕策略是全采，也必须豁免
+
+	deps := Deps{
+		Cfg: cfg, Log: discardLogger(), AllowFixed: true,
+		EmbeddedPublicKey: pub, Uploader: stub,
+		// 注入"这两个卷根同属一块物理磁盘"。真机上的实现由 winvol 负责。
+		SameDiskRoots: func(string) ([]string, error) {
+			return []string{markerRoot, drive}, nil
+		},
+	}
+	res, err := Run(context.Background(), deps, drive)
+	if err != nil {
+		t.Fatalf("作业不应报错: %v", err)
+	}
+	if res.Branch != BranchSkipped || res.SkipReason != SkipReasonExemptDiskMarker {
+		t.Fatalf("应因同盘磁盘级标记跳过，实际 branch=%s reason=%s", res.Branch, res.SkipReason)
+	}
+	if res.Collect.ExemptMarkerFound || !res.Collect.ExemptDiskMarkerFound {
+		t.Fatalf("应记录为磁盘级豁免（而非卷级）：%+v", res.Collect)
+	}
+	if res.Collect.ExemptDiskMarkerRoot != markerRoot {
+		t.Fatalf("审计要能说清凭什么豁免，命中的卷根 = %q，期望 %q",
+			res.Collect.ExemptDiskMarkerRoot, markerRoot)
+	}
+	if res.Zip.Files != 0 || res.Encrypt.CipherBytes != 0 {
+		t.Fatalf("豁免时不应打包任何东西: %+v", res.Zip)
+	}
+	if len(stub.calls()) != 0 {
+		t.Fatal("豁免时不应发起任何上传")
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("豁免时输出目录必须为空，实际 %d 个文件", len(entries))
+	}
+
+	// 审计记录必须能与卷级豁免区分开：复盘时要能回答"为什么这一卷也跳过了"。
+	raw, err := os.ReadFile(auditFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"exempt_disk_marker":true`) {
+		t.Fatalf("审计未标记磁盘级豁免：%s", string(raw))
+	}
+	if !strings.Contains(string(raw), `"skip_reason":"`+SkipReasonExemptDiskMarker+`"`) {
+		t.Fatalf("审计未记录磁盘级跳过原因：%s", string(raw))
+	}
+}
+
 func TestRunPolicyOffSkipsWithoutReading(t *testing.T) {
 	srcRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(srcRoot, "a.txt"), []byte("data"), 0o600); err != nil {

@@ -159,7 +159,8 @@ func printUsage(w io.Writer) {
 		"  --keep            上传成功后保留本地产物",
 		"",
 		"行为概述：",
-		"  盘根有授权标记 .usbbackup-allow → **豁免**，不读取不打包不上传；",
+		"  盘根有授权标记 .usbbackup-allow → 本卷**豁免**，不读取不打包不上传；",
+		"  同一物理磁盘上任意卷根有 .usbbackup-allow-disk → **整支盘豁免**（含其它分区）；",
 		"  否则按采集策略（all / marker_only / off）决定是否采集；",
 		"  采集 + 已占用容量 ≤ 阈值 → 整盘打包、混合加密，并按配置上传到 R2；",
 		"  全程对源介质只读，不删除或改写源盘上的任何文件。",
@@ -451,6 +452,9 @@ func cmdOnce(args []string, cfgPath string, stdout, stderr io.Writer) int {
 		fsutil.HumanBytes(res.Volume.UsedBytes), fsutil.HumanBytes(cfg.Gate.UsedThresholdBytes))
 	fmt.Fprintf(stdout, "授权标记        : %s\n", yesNoText(res.Collect.ExemptMarkerFound,
 		"命中（本盘豁免，不会被读取或上传）", "未命中"))
+	if res.Collect.ExemptDiskMarkerChecked {
+		fmt.Fprintf(stdout, "磁盘级授权标记  : %s\n", exemptDiskText(res.Collect))
+	}
 	fmt.Fprintf(stdout, "采集判定        : %s\n", collectDecisionText(res.Collect))
 	fmt.Fprintf(stdout, "分支            : %s\n", res.Branch)
 	if res.SkipReason != "" {
@@ -490,7 +494,9 @@ func cmdOnce(args []string, cfgPath string, stdout, stderr io.Writer) int {
 func collectDecisionText(d collectpolicy.Decision) string {
 	switch {
 	case d.ExemptMarkerFound:
-		return "豁免（盘根有授权标记）"
+		return "豁免（卷根有授权标记）"
+	case d.ExemptDiskMarkerFound:
+		return "豁免（同物理磁盘上有磁盘级授权标记）"
 	case d.Collect:
 		return "允许采集"
 	case d.Reason == collectpolicy.ReasonDisabled:
@@ -501,6 +507,22 @@ func collectDecisionText(d collectpolicy.Decision) string {
 		return "拒绝（" + d.Reason + "）"
 	default:
 		return "拒绝"
+	}
+}
+
+// exemptDiskText 把磁盘级授权标记的检查结果翻译成一行中文。
+//
+// 三种结局必须能区分：命中、查过但没命中、**根本没查成**（通常是权限不足）。
+// 第三种最容易被误读成"没标记"，所以它必须显式说出来——使用者据此才知道
+// 多分区介质上还有被采集的风险。
+func exemptDiskText(d collectpolicy.Decision) string {
+	switch {
+	case d.ExemptDiskMarkerFound:
+		return fmt.Sprintf("命中于 %s（整支盘豁免，含其它分区）", d.ExemptDiskMarkerRoot)
+	case d.ExemptDiskCheckErr != "":
+		return fmt.Sprintf("未能检查：%s", d.ExemptDiskCheckErr)
+	default:
+		return "未命中"
 	}
 }
 
@@ -636,17 +658,22 @@ func cmdProbe(args []string, cfgPath string, stdout, stderr io.Writer) int {
 		fsutil.HumanBytes(v.TotalBytes), fsutil.HumanBytes(v.UsedBytes), fsutil.HumanBytes(v.FreeBytes))
 	fmt.Fprintf(stdout, "  产物命名        : %s\n", backup.ProductName(v))
 
-	// 采集准入：授权标记豁免 + 策略判定。这一步**只 Stat 两个文件名**，
-	// 不打开盘上任何文件，所以 probe 在满盘上也几乎是瞬时的。
+	// 采集准入：授权标记豁免（卷级 → 磁盘级）+ 策略判定。
+	// 标记判定**只 Stat 文件名**、不打开盘上任何文件；磁盘级那一步要查一次
+	// 本卷所属的物理磁盘号（只读 IOCTL，权限不足时会明确报"未能检查"）。
+	// 因此 probe 在满盘上也几乎是瞬时的。
 	policy, perr := collectpolicy.Normalize(cfg.Collect.Policy)
 	if perr != nil {
 		fmt.Fprintf(stderr, "错误：%v\n", perr)
 		return cli.ExitRuntime
 	}
 	dec, derr := collectpolicy.Decide(root, collectpolicy.Options{
-		Policy:       policy,
-		Marker:       cfg.Collect.MarkerFile,
-		ExemptMarker: cfg.Collect.ExemptMarkerFile,
+		Policy:           policy,
+		Marker:           cfg.Collect.MarkerFile,
+		ExemptMarker:     cfg.Collect.ExemptMarkerFile,
+		ExemptDiskMarker: cfg.Collect.ExemptDiskMarkerFile,
+		// probe 是诊断命令，这里就要给出真实结论：查磁盘号同样是只读操作。
+		SameDiskRoots: winvol.SameDiskRoots,
 	})
 	if derr != nil {
 		fmt.Fprintf(stderr, "错误：%v\n", derr)
@@ -655,6 +682,8 @@ func cmdProbe(args []string, cfgPath string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  采集策略        : %s\n", policy.Describe())
 	fmt.Fprintf(stdout, "  授权标记检查    : %s（%s）\n",
 		yesNo(dec.ExemptMarkerFound), cfg.Collect.ExemptMarkerFile)
+	fmt.Fprintf(stdout, "  磁盘级授权标记  : %s（%s）\n",
+		exemptDiskText(dec), cfg.Collect.ExemptDiskMarkerFile)
 	if policy.NeedsMarker() {
 		fmt.Fprintf(stdout, "  采集标记检查    : %s（%s）\n",
 			yesNo(dec.MarkerFound), cfg.Collect.MarkerFile)
@@ -663,7 +692,11 @@ func cmdProbe(args []string, cfgPath string, stdout, stderr io.Writer) int {
 	if !dec.Collect {
 		fmt.Fprintf(stdout, "  判定            : 不采集（%s）\n", dec.Reason)
 		if dec.ExemptMarkerFound {
-			fmt.Fprintln(stdout, "                    本盘被识别为自己的盘 → 豁免，不会读取或上传其内容。")
+			fmt.Fprintln(stdout, "                    本卷被识别为自己的盘 → 豁免，不会读取或上传其内容。")
+		}
+		if dec.ExemptDiskMarkerFound {
+			fmt.Fprintf(stdout, "                    同物理磁盘上的 %s 带磁盘级标记 → 整支盘豁免（含本卷）。\n",
+				dec.ExemptDiskMarkerRoot)
 		}
 		return cli.ExitOK
 	}

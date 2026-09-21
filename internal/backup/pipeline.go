@@ -76,11 +76,20 @@ func Run(ctx context.Context, deps Deps, root string) (Result, error) {
 		return res, nil
 	}
 
-	// ---- 3) 采集准入：授权标记豁免 + 策略判定（F-G01 / F-G03′）----
+	// ---- 3) 采集准入：授权标记豁免（卷级 → 磁盘级）+ 策略判定（F-G01 / F-G03′ / F-G03″）----
+	//
+	// 磁盘级那一层要查本卷属于哪块物理磁盘，在 Windows 上需要管理员权限。
+	// 权限不足**不影响本次结论**（只是少了这层加固），但会留下告警。
+	sameDisk := deps.SameDiskRoots
+	if sameDisk == nil {
+		sameDisk = winvol.SameDiskRoots
+	}
 	dec, derr := collectpolicy.Decide(norm, collectpolicy.Options{
-		Policy:       mustPolicy(cfg),
-		Marker:       cfg.Collect.MarkerFile,
-		ExemptMarker: cfg.Collect.ExemptMarkerFile,
+		Policy:           mustPolicy(cfg),
+		Marker:           cfg.Collect.MarkerFile,
+		ExemptMarker:     cfg.Collect.ExemptMarkerFile,
+		ExemptDiskMarker: cfg.Collect.ExemptDiskMarkerFile,
+		SameDiskRoots:    sameDisk,
 	})
 	if derr != nil {
 		// 判定本身出错（例如标记名非法）说明配置有问题，按失败处理，不冒险采集。
@@ -92,16 +101,30 @@ func Run(ctx context.Context, deps Deps, root string) (Result, error) {
 	}
 	res.Collect = dec
 
+	// 磁盘级检查没做完（最常见的原因是权限不足）必须显眼：
+	// 此刻只剩卷级判定在挡，多分区介质上仍可能出现"标记过却被部分采集"。
+	// 绝不静默——使用者一旦误以为整支盘都豁免了，这个工具就失去了可信度。
+	if dec.ExemptDiskCheckErr != "" {
+		log.Warn("无法确定本卷所属物理磁盘，磁盘级授权标记本次未生效（只按卷级标记判定）",
+			"root", norm, "marker", cfg.Collect.ExemptDiskMarkerFile, "err", dec.ExemptDiskCheckErr)
+	}
+
 	if !dec.Collect {
 		res.Branch = BranchSkipped
 		res.SkipReason = mapCollectReason(dec.Reason)
 		res.OK = true
 		res.Duration = time.Since(start)
-		if dec.ExemptMarkerFound {
+		switch {
+		case dec.ExemptMarkerFound:
 			// 这条日志要显眼：它意味着"这块盘被认出来是自己人的，主动放过了"。
-			log.Info("盘根存在授权标记 → 豁免本次采集（本盘不会被读取或上传）",
+			log.Info("卷根存在授权标记 → 豁免本次采集（本卷不会被读取或上传）",
 				"root", norm, "marker", cfg.Collect.ExemptMarkerFile, "label", winvol.LabelOrFallback(vol))
-		} else {
+		case dec.ExemptDiskMarkerFound:
+			// 多分区介质上的关键一条：本卷自己没有标记，是同盘另一个卷根认领了整支盘。
+			log.Info("同一物理磁盘上存在磁盘级授权标记 → 整支盘豁免（含本卷）",
+				"root", norm, "marker", cfg.Collect.ExemptDiskMarkerFile,
+				"found_at", dec.ExemptDiskMarkerRoot, "label", winvol.LabelOrFallback(vol))
+		default:
 			log.Info("采集策略未放行，跳过",
 				"root", norm, "policy", string(mustPolicy(cfg)), "reason", dec.Reason)
 		}
@@ -129,6 +152,8 @@ func mapCollectReason(reason string) string {
 	switch reason {
 	case collectpolicy.ReasonExempt:
 		return SkipReasonExemptMarker
+	case collectpolicy.ReasonExemptDisk:
+		return SkipReasonExemptDiskMarker
 	case collectpolicy.ReasonDisabled:
 		return SkipReasonCollectDisabled
 	case collectpolicy.ReasonMarkerAbsent:
@@ -453,9 +478,13 @@ func ResultToAudit(res Result, start time.Time) AuditRecord {
 	}
 
 	// 采集准入结论（布尔值与档位名，不含盘上内容）。
-	if res.Collect.ExemptMarkerChecked || res.Collect.MarkerChecked {
+	//
+	// 条件里必须带上磁盘级检查：某次作业可能只有它跑过（卷级标记没命中，
+	// 但同盘另一个卷根带磁盘级标记），漏掉会让审计里查不到"凭什么豁免"。
+	if res.Collect.ExemptMarkerChecked || res.Collect.ExemptDiskMarkerChecked || res.Collect.MarkerChecked {
 		rec.Collected = res.Collect.Collect
 		rec.ExemptMarker = res.Collect.ExemptMarkerFound
+		rec.ExemptDiskMarker = res.Collect.ExemptDiskMarkerFound
 		rec.CollectMarker = res.Collect.MarkerFound
 		if !res.Collect.Collect {
 			rec.CollectSkipped = res.Collect.Reason

@@ -219,3 +219,54 @@ func TestGateMaxTotalComparesUsedNotCapacity(t *testing.T) {
 		t.Fatalf("上限为 0（不限制）时应放行，实际：%s", p.Reason)
 	}
 }
+
+// TestDiskNumberAndSiblings 真实查询本机卷的物理磁盘归属。
+//
+// 这条用例必须打真 API：VOLUME_DISK_EXTENTS 的字段偏移与对齐是照手册写的，
+// 只有真跑一次才能确认解析没错（写错偏移会读出一个"看起来合理"的错盘号，
+// 那种错误在单测里用假数据是发现不了的）。
+func TestDiskNumberAndSiblings(t *testing.T) {
+	roots, err := Roots()
+	if err != nil {
+		t.Skipf("枚举盘符失败，当前环境不允许：%v", err)
+	}
+	if len(roots) == 0 {
+		t.Skip("本机没有任何盘符")
+	}
+
+	checked := 0
+	for _, r := range roots {
+		n, err := DiskNumber(r)
+		if err != nil {
+			if errors.Is(err, ErrDiskQueryDenied) {
+				t.Skipf("当前会话无卷句柄权限（%v）——磁盘级豁免需管理员或服务身份", err)
+			}
+			// 单个卷查不到（空读卡器槽位等）不影响其余卷。
+			t.Logf("%s 查询磁盘号失败，跳过该卷：%v", r, err)
+			continue
+		}
+		if n > 255 {
+			t.Fatalf("%s 报告磁盘号 %d，明显不合理", r, n)
+		}
+		checked++
+
+		siblings, err := SameDiskRoots(r)
+		if err != nil {
+			t.Fatalf("SameDiskRoots(%s) 失败：%v", r, err)
+		}
+		self := false
+		for _, s := range siblings {
+			if s == r {
+				self = true
+				break
+			}
+		}
+		if !self {
+			t.Fatalf("SameDiskRoots(%s) 必须包含自身，实际返回 %v", r, siblings)
+		}
+	}
+	if checked == 0 {
+		t.Skip("没有可查询磁盘号的卷")
+	}
+	t.Logf("已核实 %d 个卷的物理磁盘归属", checked)
+}

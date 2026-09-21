@@ -1,6 +1,7 @@
 package collectpolicy
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -217,5 +218,175 @@ func TestDescribeMentionsDefaults(t *testing.T) {
 	}
 	if !PolicyMarkerOnly.NeedsMarker() || PolicyAll.NeedsMarker() {
 		t.Error("NeedsMarker 判定错误")
+	}
+}
+
+// ---- 磁盘级授权标记（.usbbackup-allow-disk）----
+//
+// 这一层存在的理由：卷级判定只认"写了标记的那个卷根"，
+// 而一支多分区盘（Ventoy 必然如此）的其余分区会被照常采集。
+// 下面用假函数模拟"同盘卷根"，把各分支覆盖全——真机上的磁盘号查询
+// 由 winvol 的用例负责，这里只验证判定语义。
+
+// fakeDisk 返回一个"这些卷根同属一块物理磁盘"的查询函数。
+func fakeDisk(roots ...string) func(string) ([]string, error) {
+	return func(string) ([]string, error) { return roots, nil }
+}
+
+func TestExemptDiskMarkerNameIsDistinct(t *testing.T) {
+	if DefaultExemptDiskMarkerFile != ".usbbackup-allow-disk" {
+		t.Fatalf("磁盘级授权标记名 = %q，期望 .usbbackup-allow-disk", DefaultExemptDiskMarkerFile)
+	}
+	if DefaultExemptDiskMarkerFile == DefaultExemptMarkerFile ||
+		DefaultExemptDiskMarkerFile == DefaultMarkerFile {
+		t.Fatal("三个标记文件名必须互不相同，否则语义会互相污染")
+	}
+	if err := ValidMarkerName(DefaultExemptDiskMarkerFile); err != nil {
+		t.Fatalf("磁盘级标记名必须是合法的单层文件名：%v", err)
+	}
+}
+
+// 核心场景：这是一支 Ventoy 盘——数据区带标记，固件区什么都没有。
+// 从固件区看过去，必须因为"同盘的数据区有磁盘级标记"而整盘豁免。
+func TestDecideExemptBySiblingDiskMarker(t *testing.T) {
+	base := t.TempDir()
+	data := filepath.Join(base, "data")
+	firm := filepath.Join(base, "firm")
+	for _, d := range []string{data, firm} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(data, DefaultExemptDiskMarkerFile), []byte("fp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := Decide(firm, Options{Policy: PolicyAll, SameDiskRoots: fakeDisk(data, firm)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Collect {
+		t.Fatal("同盘任一卷根带磁盘级标记时应整盘豁免，实际仍要采集")
+	}
+	if d.Reason != ReasonExemptDisk {
+		t.Errorf("拒绝原因 = %q，期望 %q", d.Reason, ReasonExemptDisk)
+	}
+	if !d.ExemptDiskMarkerChecked || !d.ExemptDiskMarkerFound {
+		t.Errorf("应记录磁盘级标记的检查情况：%+v", d)
+	}
+	if d.ExemptDiskMarkerRoot != data {
+		t.Errorf("命中的卷根 = %q，期望 %q（审计要能说清凭什么豁免）", d.ExemptDiskMarkerRoot, data)
+	}
+}
+
+// 磁盘级标记与卷级一样，不受策略档位影响——off / marker_only 下都要豁免。
+func TestDecideDiskMarkerOverridesPolicy(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, DefaultExemptDiskMarkerFile), []byte("fp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []Policy{PolicyAll, PolicyMarkerOnly, PolicyOff} {
+		d, err := Decide(dir, Options{Policy: p, SameDiskRoots: fakeDisk(dir)})
+		if err != nil {
+			t.Fatalf("档位 %s：%v", p, err)
+		}
+		if d.Collect || d.Reason != ReasonExemptDisk {
+			t.Errorf("档位 %s 下磁盘级标记应豁免，实际 %+v", p, d)
+		}
+	}
+}
+
+func TestDecideDiskMarkerAbsent(t *testing.T) {
+	dir := t.TempDir()
+	d, err := Decide(dir, Options{
+		Policy:        PolicyAll,
+		SameDiskRoots: fakeDisk(dir, filepath.Join(dir, "sibling")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Collect || d.Reason != "" {
+		t.Errorf("没有磁盘级标记时应照常按策略放行：%+v", d)
+	}
+	if !d.ExemptDiskMarkerChecked || d.ExemptDiskMarkerFound {
+		t.Errorf("应记录已查过但未命中的状态：%+v", d)
+	}
+	if d.ExemptDiskCheckErr != "" {
+		t.Errorf("正常查询不应留下错误：%q", d.ExemptDiskCheckErr)
+	}
+}
+
+// 查不到磁盘归属（最常见的是普通权限下打不开卷句柄）时的行为：
+// **不能因此拒绝一块本来该备份的盘**，但必须把原因带出去让上层告警。
+func TestDecideDiskQueryFailureIsLoudButNotFatal(t *testing.T) {
+	boom := errors.New("缺少管理员权限")
+	d, err := Decide(t.TempDir(), Options{
+		Policy:        PolicyAll,
+		SameDiskRoots: func(string) ([]string, error) { return nil, boom },
+	})
+	if err != nil {
+		t.Fatalf("磁盘查询失败不该让整个判定报错：%v", err)
+	}
+	if !d.Collect {
+		t.Error("磁盘查询失败时仍应按策略放行，不能因此跳过备份")
+	}
+	if !strings.Contains(d.ExemptDiskCheckErr, "缺少管理员权限") {
+		t.Errorf("必须把失败原因带出来供上层告警，实际 %q", d.ExemptDiskCheckErr)
+	}
+	if d.ExemptDiskMarkerFound {
+		t.Error("查询失败时不能声称命中了标记")
+	}
+}
+
+// 没有注入查询能力（非 Windows，或调用方选择不做这一层）：
+// 只做卷级判定，且不能声称"检查过磁盘级标记"。
+func TestDecideDiskMarkerSkippedWithoutQuery(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, DefaultExemptDiskMarkerFile), []byte("fp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d, err := Decide(dir, Options{Policy: PolicyAll})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Collect {
+		t.Error("没有磁盘查询能力时只做卷级判定，磁盘级标记不该被识别")
+	}
+	if d.ExemptDiskMarkerChecked {
+		t.Error("没有查询能力就不该声称检查过磁盘级标记")
+	}
+}
+
+// 同名目录不算标记文件（与卷级标记同一约定）。
+func TestDecideDiskMarkerDirectoryDoesNotCount(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, DefaultExemptDiskMarkerFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	d, err := Decide(dir, Options{Policy: PolicyAll, SameDiskRoots: fakeDisk(dir)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Collect {
+		t.Error("同名目录不是标记文件，不应触发豁免")
+	}
+}
+
+// 自定义磁盘级标记名。
+func TestDecideCustomDiskMarkerName(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".my-allow-disk"), []byte("fp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d, err := Decide(dir, Options{
+		Policy:           PolicyAll,
+		ExemptDiskMarker: ".my-allow-disk",
+		SameDiskRoots:    fakeDisk(dir),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Collect || d.Reason != ReasonExemptDisk {
+		t.Errorf("自定义磁盘级标记名未生效：%+v", d)
 	}
 }

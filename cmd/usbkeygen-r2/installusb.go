@@ -29,8 +29,9 @@ type toolkitOptions struct {
 	Dest string
 	// SubDir 是工具在盘内的相对子目录（如 `backup\tools`）；空表示直接放盘根。
 	//
-	// 注意：`.usbbackup-allow` 不受它影响，永远写在 Dest 下——
-	// 授权标记只在卷根被检查（collectpolicy 只 Stat `<root>\.usbbackup-allow`），
+	// 注意：两个授权标记（`.usbbackup-allow` / `.usbbackup-allow-disk`）
+	// 不受它影响，永远写在 Dest 下——标记只在**卷根**被检查
+	// （collectpolicy 只 Stat `<root>\.usbbackup-allow`），
 	// 一旦挪进子目录，这个盘就会被当成普通介质采集走。
 	SubDir string
 	// ToolDir 是工具 exe 的来源目录（一般是本程序所在目录）。
@@ -93,16 +94,21 @@ type toolkitOptions struct {
 //	├── r2.json               可选：凭据素材（**不含 secret**），供目标机器现场生成凭据
 //	├── keys\usbbackup-r2.pub.pem
 //	├── keys\usbbackup-r2.key.pem（默认带；--without-private 可排除）
-//	├── .usbbackup-allow     授权标记，内容是公钥指纹
+//	├── .usbbackup-allow     授权标记（卷级）：本卷豁免
+//	├── .usbbackup-allow-disk 授权标记（磁盘级）：同一物理磁盘上所有卷一起豁免
 //	└── README.txt            用法与私钥风险说明
 //
 // 上传能力与"带不带凭据"是**两件事**：--upload 让内嵌客户端开启上传但盘上不放凭据
 // （凭据在目标机器上现场生成，DPAPI 机器绑定档），--cred 则是凭据 + 上传一起进盘。
 // 只有在这两个都不给时才关闭上传。
 //
-// `.usbbackup-allow` 的语义是**豁免**：客户端读到它就知道"这是自己人的盘，
-// 里面甚至有私钥"，于是拒绝采集——工具盘不会被自己人打包上传。
-// 这个文件名与不含出站能力的版本完全一致，两个项目的盘互相认。
+// 两个授权标记的语义都是**豁免**：客户端读到卷级那份就知道"这是自己人的卷，
+// 里面甚至有私钥"，于是拒绝采集；读到磁盘级那份则把范围放大到**整块物理磁盘**
+// ——多分区介质（Ventoy 盘是最典型的）必须靠后者，否则只在主分区放标记时，
+// 固件分区会被当成陌生介质整盘打包上传。
+//
+// `.usbbackup-allow` 这个文件名与不含出站能力的版本（项目 A）完全一致，两边的盘互相认；
+// `.usbbackup-allow-disk` 是本项目新增的，A 不认它，但也不受影响（A 只看前者）。
 func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("install-usb", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -257,8 +263,11 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	fmt.Fprintln(stdout)
-	fmt.Fprintln(stdout, "  这个盘不会再被客户端采集走：盘根有 .usbbackup-allow（授权标记），")
-	fmt.Fprintln(stdout, "  客户端读到它就豁免，不会读取、打包或上传盘上任何内容。")
+	fmt.Fprintln(stdout, "  这个盘不会再被客户端采集走：盘根写了两个授权标记——")
+	fmt.Fprintln(stdout, "    .usbbackup-allow       → 本卷豁免（与另一版本共用，它的客户端也认）")
+	fmt.Fprintln(stdout, "    .usbbackup-allow-disk  → 同一物理磁盘上**所有卷**一起豁免")
+	fmt.Fprintln(stdout, "  第二个是必需的：多分区盘（Ventoy 之类）只在主分区放标记时，")
+	fmt.Fprintln(stdout, "  其余分区会被当成陌生介质整盘打包上传。")
 	fmt.Fprintln(stdout)
 	fmt.Fprintf(stdout, "  用法：把 %s 所在目录整个拷到目标机的本地目录（**别直接在盘上跑**——\n",
 		pathOnDisk(root, sub, "client.exe"))
@@ -487,6 +496,22 @@ func assembleToolkit(opt toolkitOptions, out io.Writer) (int, error) {
 	fmt.Fprintf(out, "  [OK] .usbbackup-allow（授权标记 → 本盘被豁免；%s）\n", action)
 	written++
 
+	// 4b) 磁盘级授权标记：把豁免的作用域从**这个卷**提升到**整块物理磁盘**。
+	//
+	// 为什么必须多写这一个：卷级标记只认写了它的那个卷根，而使用者的心智模型是
+	// "这支 U 盘"。一支 Ventoy 盘必然有第二个分区（VTOYEFI），只在数据区放标记时，
+	// 客户端扫到那个分区照样整盘打包上传——2026-09-20 部署实测就是这么踩到的
+	// （27.44 MiB 的固件分区被采集）。
+	//
+	// 只写主分区的盘根即可：判定时会去查同一物理磁盘上的所有卷根。
+	// 不去写别的分区，是因为**客户端对介质全程只读**，这条约束不为例外让路。
+	action, err = mergeExemptDiskMarker(filepath.Join(opt.Dest, ".usbbackup-allow-disk"), fpText)
+	if err != nil {
+		return written, fmt.Errorf("写入磁盘级授权标记失败: %w", err)
+	}
+	fmt.Fprintf(out, "  [OK] .usbbackup-allow-disk（磁盘级授权标记 → 同物理磁盘所有卷一起豁免；%s）\n", action)
+	written++
+
 	// 5) 说明文件（每次都重写，保证与盘内实际内容一致）。
 	//    README 必须如实反映私钥是否带口令，否则现场的人会按错误的风险等级处理。
 	//    它落在工具目录里，所以文中的相对路径（keys\…）在有无子目录时都成立。
@@ -567,18 +592,39 @@ func cleanSubDir(sub string) string {
 //
 // 返回一句动作描述供输出（新建 / 追加 / 已是相同指纹）。
 func mergeExemptMarker(path, fingerprint string) (string, error) {
-	body := func(origin string) string {
-		return fmt.Sprintf("# usbbackup-r2 授权标记：本盘被豁免，客户端不会采集/上传它的内容\n"+
+	return mergeMarker(path, fingerprint, func(origin, fp string) string {
+		return fmt.Sprintf("# usbbackup-r2 授权标记（卷级）：本卷被豁免，客户端不会采集/上传它的内容\n"+
 			"# 生成时间 %s（生成器 %s；%s）\nfingerprint=%s\n",
-			time.Now().Format(time.RFC3339), version.Version, origin, fingerprint)
-	}
+			time.Now().Format(time.RFC3339), version.Version, origin, fp)
+	})
+}
 
+// mergeExemptDiskMarker 把公钥指纹并入盘根的**磁盘级**授权标记文件。
+//
+// 与卷级那份共用同一套"只追加、幂等"的实现，理由也一样（重复装盘不该越写越长），
+// 差别只在文件里的说明文字——一个说"本卷豁免"，一个说"整支盘豁免"，
+// 免得现场的人看到两行几乎一样的注释却分不清哪个是哪个。
+//
+// 为什么两个都要写：卷级那份是与项目 A 共用的约定（A 只认它），
+// 磁盘级这份是本项目补的多分区缺口（A 不认它）。少了前者，A 会把这块盘当普通介质；
+// 少了后者，本项目的客户端会把盘上其它分区采集走。两个都在，才算真的豁免。
+func mergeExemptDiskMarker(path, fingerprint string) (string, error) {
+	return mergeMarker(path, fingerprint, func(origin, fp string) string {
+		return fmt.Sprintf("# usbbackup-r2 授权标记（磁盘级）：**同一物理磁盘上的所有卷**一起被豁免\n"+
+			"# 多分区介质（例如 Ventoy 盘）必须靠它：只在某一个分区放卷级标记时，\n"+
+			"# 其余分区仍会被采集。本文件放在任意一个分区根目录即可。\n"+
+			"# 生成时间 %s（生成器 %s；%s）\nfingerprint=%s\n",
+			time.Now().Format(time.RFC3339), version.Version, origin, fp)
+	})
+}
+
+func mergeMarker(path, fingerprint string, body func(origin, fp string) string) (string, error) {
 	old, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return "", err
 		}
-		return "新建", os.WriteFile(path, []byte(body("首次写入")), 0o644)
+		return "新建", os.WriteFile(path, []byte(body("首次写入", fingerprint)), 0o644)
 	}
 
 	text := string(old)
@@ -590,7 +636,7 @@ func mergeExemptMarker(path, fingerprint string) (string, error) {
 	if !strings.HasSuffix(text, "\n") {
 		text += "\n"
 	}
-	text += "\n" + body("追加，原有内容保持不动")
+	text += "\n" + body("追加，原有内容保持不动", fingerprint)
 	return "追加", os.WriteFile(path, []byte(text), 0o644)
 }
 
@@ -763,7 +809,8 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		b.WriteString("  r2.json              凭据素材（**不含 secret**）：目标机器上用它生成 client.json\n")
 	}
 	b.WriteString("  keys/                密钥材料（见下方风险）\n")
-	b.WriteString("  .usbbackup-allow     授权标记（公钥指纹）→ 本盘被豁免，不会被采集\n\n")
+	b.WriteString("  .usbbackup-allow     授权标记（卷级）：本卷被豁免，不会被采集\n")
+	b.WriteString("  .usbbackup-allow-disk 授权标记（磁盘级）：同一物理磁盘所有卷一起被豁免\n\n")
 
 	if in.HasClient {
 		b.WriteString("client.exe 内嵌的门控（决定什么样的盘会被备份）\n")
@@ -831,12 +878,19 @@ func toolkitReadme(in toolkitReadmeInput) string {
 	b.WriteString("     （--cred 省略时会依次找 .\\client.json 与 %LOCALAPPDATA%\\usbbackup-r2\\client.json）\n")
 	b.WriteString("     私钥带口令时追加 --pass（交互式）或 --pass-file <口令文件>\n\n")
 	b.WriteString("为什么这个盘不会被采集走\n")
-	b.WriteString("  盘根目录有 .usbbackup-allow（内容是指纹）。客户端读到它就知道\n")
-	b.WriteString("  「这是自己人的盘，里面甚至有私钥」，于是**豁免**：不读取、不打包、不上传。\n")
-	b.WriteString("  这条判定不受采集策略影响——哪怕策略是 all 也一样豁免。\n")
-	b.WriteString("  注意：这个文件名与不含出站能力的版本共用，装盘时只**追加**指纹、\n")
+	b.WriteString("  盘根有两个授权标记（内容都是指纹）：\n")
+	b.WriteString("    .usbbackup-allow       客户端读到的卷 → **该卷**豁免\n")
+	b.WriteString("    .usbbackup-allow-disk  客户端读到它 → **同一物理磁盘上的所有卷**豁免\n")
+	b.WriteString("  客户端读到就知道「这是自己人的盘，里面甚至有私钥」，于是不读取、不打包、\n")
+	b.WriteString("  不上传。这条判定不受采集策略影响——哪怕策略是 all 也一样豁免。\n")
+	b.WriteString("  为什么要有第二个：多分区介质（U 盘里很常见，Ventoy 盘必然如此）如果只在\n")
+	b.WriteString("  主分区放标记，另一个分区就会被当成陌生介质整盘打包上传。磁盘级标记把\n")
+	b.WriteString("  豁免范围提到「这支盘」，与人的直觉一致。判定时客户端会去查同一个物理\n")
+	b.WriteString("  磁盘上的所有卷根，所以只需要在主分区的盘根放这一个文件。\n")
+	b.WriteString("  注意：卷级那个文件名与不含出站能力的版本共用，装盘时只**追加**指纹、\n")
 	b.WriteString("  从不覆盖——覆盖会把另一个项目写的指纹冲掉，那一边的客户端就会\n")
-	b.WriteString("  反过来采集这块盘。\n\n")
+	b.WriteString("  反过来采集这块盘。磁盘级那个是本项目新增的，另一个版本不认它，\n")
+	b.WriteString("  但也不受影响（它只看前者）。\n\n")
 	b.WriteString("公钥指纹\n")
 	fmt.Fprintf(&b, "  %s\n\n", in.Fingerprint)
 

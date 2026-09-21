@@ -216,6 +216,15 @@ type CollectConfig struct {
 	//
 	// 名字与不含出站能力的版本（项目 A）保持一致，两个项目的工具盘互相认。
 	ExemptMarkerFile string `json:"exempt_marker_file"`
+	// ExemptDiskMarkerFile 是**磁盘级授权标记**文件名，默认 `.usbbackup-allow-disk`。
+	//
+	// 作用域跨卷：同一物理磁盘上**任意一个**卷根带着它，该磁盘上的所有卷一起豁免。
+	// 这一层专治多分区介质——一支 Ventoy 盘的数据区带标记、固件区没带，
+	// 只有卷级判定时固件区照样会被打包上传（2026-09-20 部署实测踩到）。
+	//
+	// 客户端查物理磁盘号需要管理员权限（生产形态是 Windows 服务，权限充足）；
+	// 权限不足时这一层自动失效并留下告警，卷级判定照常起作用——绝不静默。
+	ExemptDiskMarkerFile string `json:"exempt_disk_marker_file"`
 }
 
 // UploadConfig 是上传到 Cloudflare R2 的行为配置（G-06′ / F-U01~F-U09）。
@@ -297,9 +306,10 @@ func Default() *Config {
 			PollOnly:              false,
 		},
 		Collect: CollectConfig{
-			Policy:           "all",
-			MarkerFile:       collectpolicy.DefaultMarkerFile,
-			ExemptMarkerFile: collectpolicy.DefaultExemptMarkerFile,
+			Policy:               "all",
+			MarkerFile:           collectpolicy.DefaultMarkerFile,
+			ExemptMarkerFile:     collectpolicy.DefaultExemptMarkerFile,
+			ExemptDiskMarkerFile: collectpolicy.DefaultExemptDiskMarkerFile,
 		},
 		Gate: GateConfig{
 			UsedThresholdBytes:     DefaultUsedThresholdBytes,
@@ -423,6 +433,7 @@ func (c *Config) ApplyEnv() []string {
 	set("USBBACKUP_R2_COLLECT_POLICY", &c.Collect.Policy)
 	set("USBBACKUP_R2_COLLECT_MARKER", &c.Collect.MarkerFile)
 	set("USBBACKUP_R2_COLLECT_EXEMPT_MARKER", &c.Collect.ExemptMarkerFile)
+	set("USBBACKUP_R2_COLLECT_EXEMPT_DISK_MARKER", &c.Collect.ExemptDiskMarkerFile)
 	set("USBBACKUP_R2_CREDENTIAL_FILE", &c.Upload.CredentialFile)
 	if v := strings.TrimSpace(os.Getenv("USBBACKUP_R2_UPLOAD_ENABLED")); v != "" {
 		if b, ok := parseBool(v); ok {
@@ -595,9 +606,22 @@ func (c *Config) Validate() error {
 	} else if err := collectpolicy.ValidMarkerName(name); err != nil {
 		return fmt.Errorf("collect.exempt_marker_file: %w", err)
 	}
-	// 两个标记同名 = 采集标记会把授权盘变成采集目标，正好是最危险的组合。
+	if name := strings.TrimSpace(c.Collect.ExemptDiskMarkerFile); name == "" {
+		c.Collect.ExemptDiskMarkerFile = collectpolicy.DefaultExemptDiskMarkerFile
+	} else if err := collectpolicy.ValidMarkerName(name); err != nil {
+		return fmt.Errorf("collect.exempt_disk_marker_file: %w", err)
+	}
+	// 标记同名 = 语义互相污染。最危险的一对是采集标记与卷级授权标记：
+	// 同名会让"我的工具盘"直接变成采集目标（正是最不能出的组合）。
 	if c.Collect.MarkerFile == c.Collect.ExemptMarkerFile {
 		return fmt.Errorf("collect.marker_file 与 collect.exempt_marker_file 不能同名（%q）：两者语义相反", c.Collect.MarkerFile)
+	}
+	// 卷级与磁盘级也必须分开：共用一个名字就再也表达不出"豁免一个卷"与"豁免整支盘"的区别。
+	if c.Collect.ExemptDiskMarkerFile == c.Collect.ExemptMarkerFile {
+		return fmt.Errorf("collect.exempt_disk_marker_file 与 collect.exempt_marker_file 不能同名（%q）：卷级与磁盘级语义不同", c.Collect.ExemptDiskMarkerFile)
+	}
+	if c.Collect.ExemptDiskMarkerFile == c.Collect.MarkerFile {
+		return fmt.Errorf("collect.exempt_disk_marker_file 与 collect.marker_file 不能同名（%q）", c.Collect.ExemptDiskMarkerFile)
 	}
 	if err := validateUpload(&c.Upload); err != nil {
 		return err

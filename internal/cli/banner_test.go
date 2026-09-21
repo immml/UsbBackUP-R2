@@ -238,9 +238,13 @@ func TestBannerDoesNotClaimRemovedFeatures(t *testing.T) {
 		}
 	}
 
-	// 正向：当前准入语义必须如实写出来——豁免标记与三档策略。
+	// 正向：当前准入语义必须如实写出来——两级授权标记（卷级 + 磁盘级）与三档策略。
+	// 磁盘级那项尤其不能漏：多分区介质上它是唯一能防住"标记过却被部分采集"的东西，
+	// 横幅里不提，使用者就不知道还要多放一个文件。
 	// 另需锁住"R2 没有对象版本控制"这个事实：别再退回"去开版本控制"的旧说法。
-	for _, must := range []string{".usbbackup-allow", "豁免", "marker_only", "off", "对象版本控制"} {
+	for _, must := range []string{
+		".usbbackup-allow", ".usbbackup-allow-disk", "豁免", "marker_only", "off", "对象版本控制",
+	} {
 		if !strings.Contains(flat, must) {
 			t.Errorf("横幅未披露当前准入语义的关键项 %q", must)
 		}

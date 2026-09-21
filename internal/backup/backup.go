@@ -68,6 +68,11 @@ const (
 	SkipReasonNotReady = "volume-not-ready"
 	// SkipReasonExemptMarker 表示盘根有授权标记，本次豁免（F-G03′）。
 	SkipReasonExemptMarker = "exempt-marker"
+	// SkipReasonExemptDiskMarker 表示同物理磁盘上存在磁盘级授权标记，整盘豁免（F-G03″）。
+	//
+	// 单独一个码而不是并进上面那个：复盘的常见问题是"明明只在一个分区放了标记，
+	// 为什么另一个分区也被跳过了"，答案就写在这个码里。
+	SkipReasonExemptDiskMarker = "exempt-disk-marker"
 	// SkipReasonCollectDisabled 表示采集策略为 off。
 	SkipReasonCollectDisabled = "collect-disabled"
 	// SkipReasonNoCollectMarker 表示 marker_only 档位下未找到采集标记。
@@ -95,6 +100,11 @@ type Deps struct {
 	Uploader Uploader
 	// UploadPrefix 覆盖对象键前缀；为空时用凭据里的前缀。
 	UploadPrefix string
+	// SameDiskRoots 覆盖"同物理磁盘卷根"查询（联调与测试注入）。
+	//
+	// 为 nil 时用 winvol.SameDiskRoots（真机实现，需管理员权限）；
+	// 传入一个返回错误的函数即可复现"权限不足 → 磁盘级豁免未生效"的告警路径。
+	SameDiskRoots func(root string) ([]string, error)
 }
 
 // AuditRecord 是写入 audit.jsonl 的一行。
@@ -116,11 +126,14 @@ type AuditRecord struct {
 	// ---- 采集准入（F-G02 / F-H03）----
 	//
 	// 全部是布尔值与档位名，不含文件名、不含标记内容。
-	CollectPolicy  string `json:"collect_policy,omitempty"`
-	Collected      bool   `json:"collected"`
-	ExemptMarker   bool   `json:"exempt_marker"`
-	CollectMarker  bool   `json:"collect_marker,omitempty"`
-	CollectSkipped string `json:"collect_skip_reason,omitempty"`
+	CollectPolicy string `json:"collect_policy,omitempty"`
+	Collected     bool   `json:"collected"`
+	ExemptMarker  bool   `json:"exempt_marker"`
+	// ExemptDiskMarker 表示本次是因**同物理磁盘**上的磁盘级授权标记而豁免。
+	// 与 ExemptMarker 分开记：复盘时要能区分"本卷自己带标记"与"同盘另一个卷认领了整支盘"。
+	ExemptDiskMarker bool   `json:"exempt_disk_marker,omitempty"`
+	CollectMarker    bool   `json:"collect_marker,omitempty"`
+	CollectSkipped   string `json:"collect_skip_reason,omitempty"`
 
 	// SkipReason 仅在跳过时有值。
 	SkipReason string `json:"skip_reason,omitempty"`
