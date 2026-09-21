@@ -285,18 +285,33 @@ type Config struct {
 	Log       LogConfig       `json:"log"`
 }
 
-// Default 返回内置默认配置。
-func Default() *Config {
-	appData := os.Getenv("LOCALAPPDATA")
-	if appData == "" {
-		appData = os.TempDir()
-	}
-	base := filepath.Join(appData, version.AppName)
+// ---- 可移植路径模板（默认值一律写成模板，不写解析后的绝对路径）----
+//
+// 这几个默认路径**必须在目标机器上解析**，不能在本机烙死。
+// 生成器会把整份配置序列化后内嵌进 client.exe，而它常常在另一台机器上生成；
+// 一旦这里写成构建机解析好的绝对路径，换台机器之后日志、审计、产物、凭据
+// 全部落到一个**根本不存在的用户目录**下（例如 C:\Users\flowe\...）。
+//
+// 最坏的情况不报错：服务模式没有控制台（useConsole=false），日志目录又建不出来时
+// logx 会退化成 io.Discard —— 服务照常跑，但**一行日志都不落**，
+// 而那句降级警告写在 stderr 上，对服务来说同样是黑洞。
+//
+// 所有消费点都会经过 ExpandPath，所以模板一定能落地。
+const (
+	// PortableBaseDir 是按目标机器解析的配置根目录。
+	PortableBaseDir = `%LOCALAPPDATA%` + `\` + version.AppName
+	// PortableOutputDir 是产物输出目录（目标机器的临时目录下）。
+	PortableOutputDir = `%TEMP%\backup`
+)
 
+// Default 返回内置默认配置。
+//
+// 路径字段写的是**模板**而不是解析后的绝对路径，理由见 PortableBaseDir 的说明。
+func Default() *Config {
 	return &Config{
-		OutputDir:     filepath.Join(os.TempDir(), "backup"),
-		PublicKeyPath: filepath.Join(base, "keys", "usbbackup-r2.pub.pem"),
-		AuditFile:     filepath.Join(base, "audit.jsonl"),
+		OutputDir:     PortableOutputDir,
+		PublicKeyPath: filepath.Join(PortableBaseDir, "keys", "usbbackup-r2.pub.pem"),
+		AuditFile:     filepath.Join(PortableBaseDir, "audit.jsonl"),
 		Monitor: MonitorConfig{
 			PollIntervalSec:       5,
 			DebounceSec:           5,
@@ -329,7 +344,7 @@ func Default() *Config {
 			// 默认关闭：模板程序（不内嵌配置）应当保持"不上传"的保守行为。
 			// 生成器产出的客户端会把这里改成 true（见 clientgen）。
 			Enabled:                 false,
-			CredentialFile:          filepath.Join(base, "client.json"),
+			CredentialFile:          filepath.Join(PortableBaseDir, "client.json"),
 			MultipartThresholdBytes: 64 * 1024 * 1024,
 			PartSizeBytes:           64 * 1024 * 1024,
 			MaxRetries:              5,
@@ -339,7 +354,7 @@ func Default() *Config {
 		},
 		Log: LogConfig{
 			Level:      "info",
-			File:       filepath.Join(base, "logs", version.AppName+".log"),
+			File:       filepath.Join(PortableBaseDir, "logs", version.AppName+".log"),
 			MaxSizeMB:  10,
 			MaxBackups: 5,
 			Console:    true,
@@ -348,6 +363,9 @@ func Default() *Config {
 }
 
 // DefaultConfigPath 返回默认配置文件路径：%LOCALAPPDATA%\usbbackup-r2\config.json。
+//
+// 这里返回的是**解析后的绝对路径**（与 Default 里的模板不同）：它是用来"找"配置文件的，
+// 文件本身要落在这台机器的真实目录上，不存在"换台机器再解析"的语义。
 func DefaultConfigPath() string {
 	appData := os.Getenv("LOCALAPPDATA")
 	if appData == "" {
@@ -547,11 +565,19 @@ func parseBool(s string) (bool, bool) {
 func expandPercentVars(s string) string {
 	return percentVarRe.ReplaceAllStringFunc(s, func(m string) string {
 		name := m[1 : len(m)-1]
-		if v, ok := os.LookupEnv(name); ok {
+		// 变量存在但为空，等同于没设：直接返回空串会拼出 "\usbbackup-r2\..." 这种
+		// 既不绝对也建不出来的路径，比留着字面量更难排障。
+		if v, ok := os.LookupEnv(name); ok && strings.TrimSpace(v) != "" {
 			return v
 		}
 		// Windows 上 TEMP/TMP 两者常混用，做一次同义映射增强健壮性。
 		if name == "TEMP" {
+			return os.TempDir()
+		}
+		// LOCALAPPDATA 缺失时**必须给兜底**，不能把 %LOCALAPPDATA% 当字面量留在路径里——
+		// 默认配置里每个路径都以它开头，留下字面量会得到一个既不绝对、
+		// 又永远建不出来的目录。取临时目录，与内置默认原来的兜底一致。
+		if name == "LOCALAPPDATA" {
 			return os.TempDir()
 		}
 		return m
@@ -680,17 +706,20 @@ func validateUpload(u *UploadConfig) error {
 
 // Summary 返回用于启动日志的关键配置摘要。
 // 刻意不包含任何密钥材料。
+//
+// 路径类字段**展开后再展示**：默认值是 `%LOCALAPPDATA%` / `%TEMP%` 这类模板，
+// 直接打印模板会让人看不出产物/日志究竟落在哪。这里展示的是"在这台机器上生效"的值。
 func (c *Config) Summary() []string {
 	uploadText := "关闭（产物只落本地）"
 	if c.Upload.Enabled {
 		uploadText = fmt.Sprintf("开启（凭据 %s，分片阈值 %s，失败重试 %d 次）",
-			c.Upload.CredentialFile, humanGiB(c.Upload.MultipartThresholdBytes), c.Upload.MaxRetries)
+			ExpandPath(c.Upload.CredentialFile), humanGiB(c.Upload.MultipartThresholdBytes), c.Upload.MaxRetries)
 	}
 	// 采集策略用归一化后的值展示：配置里写错大小写时，日志要显示**实际生效**的档位。
 	policy, _ := collectpolicy.Normalize(c.Collect.Policy)
 	return []string{
-		fmt.Sprintf("产物输出目录    = %s", c.OutputDir),
-		fmt.Sprintf("公钥路径        = %s", c.PublicKeyPath),
+		fmt.Sprintf("产物输出目录    = %s", ExpandPath(c.OutputDir)),
+		fmt.Sprintf("公钥路径        = %s", ExpandPath(c.PublicKeyPath)),
 		fmt.Sprintf("授权标记(豁免)  = %s（仅认盘根；命中即拒绝采集）", c.Collect.ExemptMarkerFile),
 		fmt.Sprintf("采集策略        = %s", policy.Describe()),
 		fmt.Sprintf("采集标记        = %s（marker_only 档位使用）", c.Collect.MarkerFile),
@@ -699,7 +728,7 @@ func (c *Config) Summary() []string {
 		fmt.Sprintf("上传到 R2       = %s", uploadText),
 		fmt.Sprintf("轮询间隔        = %ds（事件驱动为主，轮询兜底）", c.Monitor.PollIntervalSec),
 		fmt.Sprintf("作业超时        = %d 分钟", c.Monitor.JobTimeoutMin),
-		fmt.Sprintf("日志级别/文件   = %s / %s", c.Log.Level, c.Log.File),
+		fmt.Sprintf("日志级别/文件   = %s / %s", c.Log.Level, ExpandPath(c.Log.File)),
 	}
 }
 

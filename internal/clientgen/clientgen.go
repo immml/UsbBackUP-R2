@@ -217,6 +217,18 @@ func Build(opt Options) (Result, error) {
 	}, nil
 }
 
+// OutputDirText 返回给运维看的产物目录描述。
+//
+// 默认值是 `%TEMP%\backup` 这类**模板**，会在目标机器上解析；只有运维显式用
+// --output-dir 指定了绝对路径时才是定死的。两种情形要区分开，否则
+// 看到模板的人会以为是本机路径、看到绝对路径的人会以为是模板。
+func (r Result) OutputDirText() string {
+	if strings.Contains(r.OutputDir, "%") {
+		return r.OutputDir + "（模板，在目标机器上解析）"
+	}
+	return r.OutputDir
+}
+
 // DefaultTemplate 返回默认模板路径：与本程序同目录的 usbbackup-r2.exe。
 func DefaultTemplate() string {
 	exe, err := os.Executable()

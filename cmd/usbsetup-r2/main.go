@@ -341,7 +341,7 @@ func printResult(stdout io.Writer, res clientgen.Result) {
 	fmt.Fprintf(stdout, "  输出        : %s\n", res.OutputPath)
 	fmt.Fprintf(stdout, "  客户端标识  : %s\n", res.ClientName)
 	fmt.Fprintf(stdout, "  内嵌公钥    : %d 位，指纹 %s\n", res.KeyBits, res.Fingerprint)
-	fmt.Fprintf(stdout, "  产物输出目录: %s\n", res.OutputDir)
+	fmt.Fprintf(stdout, "  产物输出目录: %s\n", res.OutputDirText())
 	fmt.Fprintf(stdout, "  容量阈值    : %s\n", res.ThresholdText)
 	fmt.Fprintf(stdout, "  打包上限    : %s\n", res.MaxTotalText)
 	fmt.Fprintf(stdout, "  上传到 R2   : %v\n", res.UploadEnabled)

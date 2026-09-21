@@ -666,6 +666,12 @@ setx /M USBBACKUP_R2_CRED_PASSPHRASE_FILE "C:\ProgramData\usbbackup-r2\cred.pass
 - 服务模式写到 `%LOCALAPPDATA%\usbbackup-r2\logs\usbbackup-r2.log`（轮转：单文件 10 MB，保留 5 份）。
 - 审计在 `%LOCALAPPDATA%\usbbackup-r2\audit.jsonl`，一行一条 JSON。
 
+> **这里的 `%LOCALAPPDATA%` 是"跑这个进程的账户"的，不是你登录账户的。** 服务以 `LocalSystem` 运行，
+> 于是它的 `%LOCALAPPDATA%` = `C:\Windows\System32\config\systemprofile\AppData\Local`——去自己的
+> `C:\Users\<你>\AppData\Local\usbbackup-r2\` 找服务日志是**找不到**的（那里只有前台运行留下的那份）。
+> 这个值不是构建时写死的：`client.exe` 内嵌的配置里存的是模板，在**目标机器上运行时**才解析
+> （§8.3 第 20 条就是这么发现的）。
+
 ### 常见问题
 
 | 现象 | 原因与处置 |

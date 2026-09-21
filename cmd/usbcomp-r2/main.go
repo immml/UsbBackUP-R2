@@ -135,7 +135,8 @@ func cmdPack(args []string, cfgPath string, stdout, stderr io.Writer) int {
 
 	pub := *pubPath
 	if pub == "" {
-		pub = cfg.PublicKeyPath
+		// 默认值是 %LOCALAPPDATA% 模板，必须展开后再用。
+		pub = config.ExpandPath(cfg.PublicKeyPath)
 	}
 	if pub == "" {
 		fmt.Fprintln(stderr, "错误：未指定公钥。请先用 `usbkeygen-r2 use <公钥.pem>` 登记，或使用 --public 指定。")

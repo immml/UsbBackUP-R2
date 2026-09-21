@@ -961,6 +961,20 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		b.WriteString("  - token 请用「Object Read & Write + 仅限目标桶」，不要用 Admin 两档，\n")
 		b.WriteString("    并定期轮换；R2 没有对象版本控制，删除**没有原生兜底**。\n\n")
 	}
+	b.WriteString("产物、日志与审计落在哪\n")
+	b.WriteString("  客户端内嵌的配置里，这些路径存的是**模板**（%TEMP% / %LOCALAPPDATA%），\n")
+	b.WriteString("  在目标机器上运行时才解析成真实路径——所以换台机器不用重新生成二进制。\n")
+	b.WriteString("  产物输出目录    %TEMP%\\backup\n")
+	b.WriteString("  日志与审计      %LOCALAPPDATA%\\usbbackup-r2\\（usbbackup-r2.log / audit.jsonl）\n")
+	b.WriteString("  [!] 这里的 %LOCALAPPDATA% 是**跑进程那个账户**的，不是你登录账户的。\n")
+	b.WriteString("      服务以 LocalSystem 运行，它的 %LOCALAPPDATA% 是\n")
+	b.WriteString("      C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local —— 去自己的\n")
+	b.WriteString("      C:\\Users\\<你>\\AppData\\Local\\usbbackup-r2\\ 找服务日志是找不到的。\n")
+	if in.UploadEnabled {
+		b.WriteString("  上传成功之后本地产物会被删除，R2 上那份是唯一副本。\n\n")
+	} else {
+		b.WriteString("  上传未开启，产物只留在本机（不会被删除）。\n\n")
+	}
 	if in.HasPrivate && in.PrivateEncrypted {
 		b.WriteString("[!] 私钥风险（口令保护）\n")
 		b.WriteString("  keys\\usbbackup-r2.key.pem 带口令保护：不知道口令则无法解开。\n")

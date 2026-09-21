@@ -277,7 +277,7 @@ func cmdUse(args []string, cfgPath string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, "公钥已登记到配置。")
 	fmt.Fprintf(stdout, "  配置文件    ：%s\n", cfgFile)
-	fmt.Fprintf(stdout, "  公钥路径    ：%s\n", cfg.PublicKeyPath)
+	fmt.Fprintf(stdout, "  公钥路径    ：%s\n", config.ExpandPath(cfg.PublicKeyPath))
 	fmt.Fprintf(stdout, "  公钥指纹    ：%s\n", fp)
 	return cli.ExitOK
 }

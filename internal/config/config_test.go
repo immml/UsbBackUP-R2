@@ -360,6 +360,71 @@ func TestHumanLimitShowsUnlimited(t *testing.T) {
 	}
 }
 
+// 机器相关的默认路径必须是**可展开的模板**，不能是构建机解析好的绝对路径。
+//
+// 生成器会把整份配置序列化后内嵌进 client.exe，而它常常在另一台机器上生成。
+// 一旦默认值烙成了 C:\Users\<构建者>\...，换台机器之后日志、审计、产物、凭据
+// 全都落到一个不存在的用户目录下。最坏的情况还不报错：服务模式没有控制台，
+// 日志目录又建不出来时 logx 会退化成 io.Discard —— 服务照跑，一行日志都不落。
+func TestDefaultPathsArePortableTemplates(t *testing.T) {
+	c := Default()
+	paths := map[string]string{
+		"output_dir":             c.OutputDir,
+		"public_key_path":        c.PublicKeyPath,
+		"audit_file":             c.AuditFile,
+		"log.file":               c.Log.File,
+		"upload.credential_file": c.Upload.CredentialFile,
+	}
+	for name, p := range paths {
+		if p == "" {
+			t.Errorf("%s 默认值不应为空", name)
+			continue
+		}
+		if !strings.Contains(p, "%") {
+			t.Errorf("%s 应是可展开模板（含 %%VAR%%），实际 %q：换机器后会指向构建机的目录", name, p)
+		}
+		if vol := filepath.VolumeName(p); vol != "" {
+			t.Errorf("%s 不应带盘符 %q，实际 %q", name, vol, p)
+		}
+		got := ExpandPath(p)
+		if !filepath.IsAbs(got) {
+			t.Errorf("%s 展开后应是绝对路径，实际 %q", name, got)
+		}
+		if strings.Contains(got, "%") {
+			t.Errorf("%s 展开后仍残留 %%，实际 %q", name, got)
+		}
+	}
+}
+
+// LOCALAPPDATA 缺失或为空时必须有兜底，不能把 %LOCALAPPDATA% 当字面量留在路径里，
+// 也不能因为变量为空而拼出 "\usbbackup-r2\..." 这种既不绝对、又建不出来的路径。
+func TestExpandPercentVarsLocalAppDataFallbacks(t *testing.T) {
+	want := filepath.Join(os.TempDir(), "usbbackup-r2", "audit.jsonl")
+	for _, val := range []string{"", "   "} {
+		t.Setenv("LOCALAPPDATA", val)
+		got := ExpandPath(`%LOCALAPPDATA%\usbbackup-r2\audit.jsonl`)
+		if strings.Contains(got, "%") {
+			t.Fatalf("LOCALAPPDATA=%q 时展开后仍残留 %%：%q", val, got)
+		}
+		if got != want {
+			t.Fatalf("LOCALAPPDATA=%q 时应回退到 %q，实际 %q", val, want, got)
+		}
+	}
+}
+
+// Summary 展示的必须是**本机生效**的路径，而不是 %TEMP% 这类模板——
+// 运维看 config-check 是为了知道东西到底落在哪。
+func TestSummaryShowsResolvedPaths(t *testing.T) {
+	c := Default()
+	joined := strings.Join(c.Summary(), "\n")
+	if strings.Contains(joined, "%TEMP%") || strings.Contains(joined, "%LOCALAPPDATA%") {
+		t.Fatalf("配置摘要里不该出现未展开的模板：\n%s", joined)
+	}
+	if !strings.Contains(joined, ExpandPath(c.OutputDir)) {
+		t.Errorf("配置摘要应展示展开后的产物目录 %q", ExpandPath(c.OutputDir))
+	}
+}
+
 func TestMaxTotalBytesEnvOverride(t *testing.T) {
 	c := Default()
 	t.Setenv("USBBACKUP_R2_MAX_TOTAL_BYTES", "2GiB")
