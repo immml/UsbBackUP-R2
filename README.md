@@ -236,6 +236,20 @@ cd D:\backup
 
 #### 第四步：部署到目标机器
 
+**最快的方式**：在目标机上双击盘里的 `install-from-usb.cmd`。它会自动把整个工具目录复制到
+`D:\backup\usbbackup-r2`、逐文件核对副本、现场生成这一台机器专用的凭据、完成首次确认、
+注册服务并设开机自启与崩溃自动重启，最后给 `D:\backup` 加"拒绝删除"加固（**只拒绝删除，
+不影响读取**，服务照常工作）。开关有 `/DRYRUN` `/UNDO` `/PURGE` `/NOAUTH` `/NOHARDEN`，
+详见盘内 `README.txt`。
+
+> ⚠️ **不要用 `icacls /deny "Everyone:(OI)(CI)(D,DC)"` 手工加固。** icacls 会悄悄把
+> `SYNCHRONIZE` 一起 deny，而遍历路径恰好需要它，结果是整棵子树**不可读**：服务读不到
+> `client.json`、脚本连自己刚复制的副本都核对不了（每个文件都报"缺失"）。脚本走 .NET
+> ACL API，只 deny `Delete + DeleteSubdirectoriesAndFiles`，防删但不妨碍读取。
+> ⚠️ 加固期间**不能**升级、迁移或卸载工具，要先跑 `/UNDO`。
+
+下面是手工做法。
+
 把 `client.exe` 与 `client.json` **放在同一个目录**，然后：
 
 ```CMD

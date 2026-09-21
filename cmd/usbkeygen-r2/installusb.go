@@ -802,6 +802,8 @@ func toolkitReadme(in toolkitReadmeInput) string {
 	if in.HasClient {
 		b.WriteString("  client.exe           已内嵌配置与公钥的客户端\n")
 	}
+	b.WriteString("  install-from-usb.cmd 一键安装器：在目标机上双击，自动装机 + 加固 + 设自启\n")
+	b.WriteString("                       （若本盘没有这个文件，从仓库 scripts/ 目录取一份放进来）\n")
 	if in.HasCredential {
 		fmt.Fprintf(&b, "  client.json          R2 凭据（%s，见下方说明）\n", protectionShort(in.CredProtection))
 	}
@@ -836,7 +838,27 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		}
 	}
 
-	b.WriteString("怎么用（目标机器上）\n")
+	b.WriteString("一键安装（推荐：在目标机里直接双击）\n")
+	b.WriteString("  install-from-usb.cmd   本盘自带的安装器。双击即可，会弹 UAC，之后全自动：\n")
+	b.WriteString("    1) 把本目录整个复制到 D:\\backup\\usbbackup-r2（服务必须绑本地路径）\n")
+	b.WriteString("    2) 逐文件核对副本（文件名 + 大小，缺一个就中止，且不碰本盘）\n")
+	b.WriteString("    3) 现场生成只属于这台机器的 R2 凭据 client.json\n")
+	b.WriteString("       （问一次 Secret Access Key，无回显，不写回本盘）\n")
+	b.WriteString("    4) 完成首次知情确认、注册服务、设开机自启 + 崩溃自动重启\n")
+	b.WriteString("    5) 联网探活一次，证明凭据真能上传（--timeout 1）\n")
+	b.WriteString("    6) 最后给 D:\\backup 加\"拒绝删除\"加固（保留可读，服务不受影响）\n")
+	b.WriteString("  开关：\n")
+	b.WriteString("    /DRYRUN   只打印计划，什么都不改        /NOAUTH   跳过凭据步骤\n")
+	b.WriteString("    /NOVERIFY 跳过联网探活                  /NOHARDEN 不加\"拒绝删除\"\n")
+	b.WriteString("    /CLEAN    先清空目标目录再装（连旧凭据一起删）\n")
+	b.WriteString("    /UNDO     撤销加固与失败重启策略\n")
+	b.WriteString("    /PURGE    /UNDO 之外再卸载服务、删除 D:\\backup\\usbbackup-r2\n")
+	b.WriteString("  [!] 加固期间不能升级/迁移/卸载工具，要先跑 /UNDO。这条加固只拒绝删除\n")
+	b.WriteString("      （Delete + DeleteSubdirectoriesAndFiles），不影响读取——服务照常读得到\n")
+	b.WriteString("      client.json。\n")
+	b.WriteString("  [!] 别在盘上直接跑 client.exe：install-service 会把服务绑死在盘符上，拔盘\n")
+	b.WriteString("      即失效。install-from-usb.cmd 就是为了解决这件事。\n")
+	b.WriteString("\n手动安装（不用脚本，逐个命令跑）\n")
 	b.WriteString("  【强烈建议】先把工具拷到目标机的本地目录再跑，例如 C:\\backup-agent。\n")
 	if in.HasCredential {
 		b.WriteString("  直接在盘上跑有两个硬伤：install-service 会把服务绑死在盘符上（拔盘即失效），\n")
