@@ -121,6 +121,11 @@ func cmdCredCheck(cfgPath string, stdout, stderr io.Writer) int {
 		return cli.ExitRuntime
 	}
 	fmt.Fprintf(stdout, "\n生效凭据：\n  %s\n", summary)
+	if p, perr := cred.ProtectionOf(path); perr == nil && p == cred.ProtectionPlainFile {
+		// 明文凭据是被自动放行读进来的（无人值守场景），但这件事必须看得见。
+		fmt.Fprintf(stdout, "\n[提示] 该凭据文件未加密（保护方式 %s），仅靠文件权限保护。\n", p)
+		fmt.Fprintln(stdout, "       客户端在无人值守下会自动放行读取，但建议改用 dpapi-machine 或口令加密。")
+	}
 	fmt.Fprintln(stdout, "\n提示：这里只做本地解密检查，不发任何网络请求。")
 	fmt.Fprintln(stdout, "      要验证端点/桶/权限是否可用，请用生成器：usbkeygen-r2 r2-check")
 	return cli.ExitOK

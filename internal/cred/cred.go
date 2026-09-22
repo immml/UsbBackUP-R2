@@ -586,6 +586,32 @@ func ProtectionOf(path string) (string, error) {
 	return doc.Protection, nil
 }
 
+// AutoOptions 按凭据文件的**实际保护方式**组出读取所需的选择项。
+//
+// 这是给"无人值守、无法交互"的客户端准备的：服务进程没有控制台，
+// 弹不出 --allow-plain-cred 这种要求人确认的提示，可它又必须能读出
+// 安装时下发的那份凭据。
+//
+// 语义边界（刻意收得很紧）：
+//   - 只对 ProtectionPlainFile 追加 WithAllowPlainFile()，其余保护方式一律不动，
+//     DPAPI 与口令加密的路径与从前完全一致；
+//   - 明文仍然要过 Load 内部的 0600 权限校验（checkPlainFilePerm），
+//     放宽的只是"要不要显式开关"这一道，不是"文件权限"那一层；
+//   - 返回 plain=true 让调用方能在日志/横幅里**明说这是明文凭据**，
+//     不允许静默——放行不等于假装它没发生过。
+//
+// 读不出保护方式时不追加任何选项，交给 Load 去报具体错误。
+func AutoOptions(path string) (opts []Option, plain bool) {
+	p, err := ProtectionOf(path)
+	if err != nil {
+		return nil, false
+	}
+	if p == ProtectionPlainFile {
+		return []Option{WithAllowPlainFile()}, true
+	}
+	return nil, false
+}
+
 // NeedsPassphrase 判断读该文件是否需要口令（不读取内容以外的任何东西）。
 func NeedsPassphrase(path string) (bool, error) {
 	p, err := ProtectionOf(path)

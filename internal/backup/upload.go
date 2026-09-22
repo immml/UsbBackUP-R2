@@ -120,7 +120,10 @@ func prepareUpload(cfg *config.Config, deps Deps, log *slog.Logger) *uploadPlan 
 		plan.reason = fmt.Sprintf("未找到凭据文件 %s；已查找：%s", CredentialFileName, strings.Join(cands, "、"))
 		return plan
 	}
-	c, err := cred.Load(path)
+	// 按文件的实际保护方式组出读取选项：明文凭据在这里被放行（见 cred.AutoOptions），
+	// 因为服务/常驻进程没有控制台可交互。明文这件事不静默——下面日志里会明写。
+	loadOpts, plainCred := cred.AutoOptions(path)
+	c, err := cred.Load(path, loadOpts...)
 	if err != nil {
 		plan.reason = fmt.Sprintf("凭据不可用（%s）：%v", path, err)
 		return plan
@@ -149,6 +152,12 @@ func prepareUpload(cfg *config.Config, deps Deps, log *slog.Logger) *uploadPlan 
 	plan.endpoint = c.Endpoint
 	if plan.prefix == "" {
 		plan.prefix = c.EffectivePrefix()
+	}
+	if plainCred {
+		// 明文凭据是安全上的降级，必须在日志里留下痕迹（不是拒绝，但也不许沉默）。
+		log.Warn("凭据文件未加密（仅靠文件权限保护），已按自动放行读取",
+			"path", path, "protect", "明文（0600）",
+			"hint", "如需消除此告警，请改用 dpapi-machine 或 passphrase 保护方式")
 	}
 	log.Info("上传通道已就绪",
 		"endpoint", c.Endpoint,

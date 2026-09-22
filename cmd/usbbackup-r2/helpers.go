@@ -44,12 +44,23 @@ func credSummary(cfg *config.Config) (string, error) {
 		}
 		return "", fmt.Errorf("未找到凭据文件；已查找：%s", strings.Join(cands, "、"))
 	}
-	c, err := cred.Load(path)
+	c, err := cred.Load(path, credAutoOpts(path)...)
 	if err != nil {
 		return "", fmt.Errorf("%s：%w", path, err)
 	}
 	defer c.Zero()
 	return path + "\n    " + strings.ReplaceAll(c.Describe(), "\n", "\n    "), nil
+}
+
+// credAutoOpts 按凭据文件的实际保护方式组出读取选项。
+//
+// 客户端是无人值守运行的（服务形态连控制台都没有），读不出明文凭据就
+// 等于安装时下发的凭据白做——所以这里按保护方式自动放行明文（见 cred.AutoOptions，
+// 明文仍受 0600 权限校验约束）。需要人工确认的交互式命令
+// （如 usbunseal-r2）仍保留 --allow-plain-cred 开关，不走这条路径。
+func credAutoOpts(path string) []cred.Option {
+	opts, _ := cred.AutoOptions(path)
+	return opts
 }
 
 // credCandidates 暴露凭据候选路径，供诊断命令把"找过哪里"讲清楚。
@@ -182,12 +193,17 @@ func reportUploadChannel(cfg *config.Config, log interface {
 			"expect", backup.CredentialFileName, "searched", strings.Join(cands, " | "))
 		return
 	}
-	c, err := cred.Load(path)
+	loadOpts, plainCred := cred.AutoOptions(path)
+	c, err := cred.Load(path, loadOpts...)
 	if err != nil {
 		log.Warn("上传已开启但凭据不可用，本次仅保留本地产物", "path", path, "err", err)
 		return
 	}
 	defer c.Zero()
+	if plainCred {
+		log.Warn("凭据文件未加密（仅靠文件权限保护），已自动放行读取",
+			"path", path, "hint", "改用 dpapi-machine 或 passphrase 可消除此告警")
+	}
 	// 只在日志里放路由信息与不可逆的短标识，绝不放凭据材料（F-F07）。
 	log.Info("上传通道可用",
 		"cred_file", path,

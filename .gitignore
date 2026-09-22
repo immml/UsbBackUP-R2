@@ -34,6 +34,13 @@ backups/
 /logs/
 /audit.jsonl
 
+# R2 凭据 —— 里面是明文/可解密的 access key，误提交等于泄露 token
+# （安装器会在目标目录写出 client.json；开发时也常落到仓库根或脚本目录）
+client.json
+.tmp-client.json
+client.bin
+.machine.key
+
 # Go 工具链本地缓存（若把 GOPATH 放在仓库内）
 /.gopath/
 
