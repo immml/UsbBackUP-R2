@@ -375,9 +375,9 @@ if not defined NOHARDEN echo    delete protection: %HARDEN_DIR% denies delete to
 echo ===========================================================================
 echo    the USB stick can be unplugged now - nothing runs from it any more.
 echo.
-echo    revert ACL + failure actions : uninstall.cmd /UNDO
-echo    remove the tool completely   : uninstall.cmd /PURGE
-if not defined NOHARDEN echo    (run /UNDO first - otherwise the wipe is refused)
+echo    remove the tool completely   : uninstall.cmd          (this is the default)
+echo    revert ACL + failure actions : uninstall.cmd /KEEP    (keeps service + files)
+if not defined NOHARDEN echo    (uninstall.cmd reverts the ACL itself - run it, do not delete by hand)
 echo.
 echo    the credential here is the same on every machine and does not expire.
 echo    rotate it by replacing client.json with a freshly built client.bin,
@@ -453,10 +453,57 @@ if exist "%DST_ROOT%" rmdir "%DST_ROOT%" 2>nul
 
 :undo_done
 echo.
+REM ---- did it actually come off? --------------------------------------------
+REM  "UNDO DONE" on its own is not an answer. The run that started this fix
+REM  printed DONE while the service was still RUNNING, so the script now
+REM  checks the result and reports it, instead of asserting it.
+set "RESIDUAL="
+if defined PURGE (
+    echo [*] checking the result ...
+    sc query "%SVC_NAME%" >nul 2>&1
+    if not errorlevel 1 set "RESIDUAL=1"
+    if exist "%DST%" set "RESIDUAL=1"
+)
+echo.
+if not defined PURGE goto :undo_banner_revert
+if defined RESIDUAL goto :undo_banner_residual
+if defined PURGE goto :undo_banner_clean
+
+:undo_banner_clean
 echo ===========================================================================
 echo    UNDO DONE
-if defined PURGE echo    service %SVC_NAME% removed, %DST% deleted.
+echo ===========================================================================
+echo    [OK] service %SVC_NAME% is gone.
+echo    [OK] %DST% is gone.
+echo    [OK] the ACL deny and the failure actions are reverted.
+echo    the USB stick was not touched.
+echo ===========================================================================
+if not defined NO_PAUSE pause
+exit /b 0
+
+:undo_banner_residual
+echo ===========================================================================
+echo    UNDO DONE - BUT SOMETHING IS STILL THERE
+echo ===========================================================================
+if exist "%DST%" echo    [x] %DST% still exists - a file in it is still open.
+if exist "%DST%" echo        close whatever holds it, or reboot, then run this again.
+sc query "%SVC_NAME%" >nul 2>&1
+if not errorlevel 1 (
+    echo    [x] service %SVC_NAME% is still registered.
+    echo        try: sc.exe stop %SVC_NAME%   then   sc.exe delete %SVC_NAME%
+)
 echo    the ACL deny and the failure actions are reverted.
+echo    the USB stick was not touched.
+echo ===========================================================================
+if not defined NO_PAUSE pause
+exit /b 1
+
+:undo_banner_revert
+echo ===========================================================================
+echo    UNDO DONE
+echo ===========================================================================
+echo    the ACL deny and the failure actions are reverted.
+echo    the service and the files were KEPT ^(/KEEP^).
 echo    the USB stick was not touched.
 echo ===========================================================================
 if not defined NO_PAUSE pause
@@ -519,8 +566,39 @@ if defined ADMIN exit /b 0
 net session >nul 2>&1
 if not errorlevel 1 set "ADMIN=1"
 if defined ADMIN exit /b 0
-echo [*] administrator rights required, raising a UAC prompt...
-powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
+
+REM Not elevated. Rebuild the switch list from the flags already parsed above
+REM instead of forwarding "%*".
+REM
+REM Why this matters: uninstall.cmd delegates by calling this script with an
+REM extra /YES, so "%*" in that path is just "/YES". Relaunching with "%*"
+REM would drop /UNDO and /PURGE, the elevated window would run a fresh
+REM INSTALL, and the operator who asked for a removal would end up looking at
+REM a service that is running again. Deriving the switches from the parsed
+REM flags makes the elevated run do what the first run was asked to do.
+set "ELEV="
+if defined UNDO      set "ELEV=/UNDO"
+if defined PURGE     set "ELEV=%ELEV% /PURGE"
+if defined DRYRUN    set "ELEV=%ELEV% /DRYRUN"
+if defined CLEAN     set "ELEV=%ELEV% /CLEAN"
+if defined NOAUTH    set "ELEV=%ELEV% /NOAUTH"
+if defined NOVERIFY  set "ELEV=%ELEV% /NOVERIFY"
+if defined NOHARDEN  set "ELEV=%ELEV% /NOHARDEN"
+if defined NO_PAUSE  set "ELEV=%ELEV% /YES"
+
+echo.
+echo [*] administrator rights are required - raising a UAC prompt ...
+echo     a second window will run : %ELEV%
+echo     this window closes now, whether or not you accept the prompt.
+powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%ELEV%' -Verb RunAs" >nul 2>&1
+if errorlevel 1 (
+    echo [x] the UAC prompt could not be raised. right-click this script and
+    echo     choose "run as administrator".
+) else (
+    echo [*] handed off to the elevated window - look for it on the taskbar.
+)
+echo.
+if not defined NO_PAUSE pause
 exit /b 1
 
 :verify_copy
