@@ -280,7 +280,7 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 		switch credentialProtection(*credPath) {
 		case cred.ProtectionDPAPIMachine:
 			fmt.Fprintln(stdout, "        [!] 这份凭据是 DPAPI 机器绑定的：本盘上的它**只在生成它的那台机器上**有效，")
-			fmt.Fprintln(stdout, "            换机器要先用 usbkeygen-r2 cred 现场重生成一份。")
+			fmt.Fprintln(stdout, "            换机器要重新生成一份（r2perm.py build + shield，或 usbkeygen-r2 cred）。")
 		case cred.ProtectionPassphrase:
 			fmt.Fprintln(stdout, "        这份凭据是口令加密的，**任何 Windows 机器都能用**——")
 			fmt.Fprintln(stdout, "        但客户端只认两个环境变量（它没有 --cred-pass-file 开关）：")
@@ -288,15 +288,17 @@ func cmdInstallUSB(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, "        漏设不会报错，只是上传被跳过、产物只留本地——请照盘上 README 第 0 步做。")
 			fmt.Fprintln(stdout, "        口令**没有写在盘上**（按设计），请另行保管。")
 		case cred.ProtectionPlainFile:
-			fmt.Fprintln(stdout, "        [!] 这份凭据是**明文**的，读到盘就拿到了 R2 访问权；")
-			fmt.Fprintln(stdout, "            读取时还需显式加 --allow-plain-cred。")
+			fmt.Fprintln(stdout, "        [!] 这份凭据是**明文**的，读到盘就拿到了 R2 访问权。")
+			fmt.Fprintln(stdout, "            客户端**无人值守时会自动放行读取**（服务没有控制台可交互），")
+			fmt.Fprintln(stdout, "            所以现场不会有「读取被拒」这种提示——只有日志里一条 WARN。")
+			fmt.Fprintln(stdout, "            交互式命令（usbunseal-r2 / r2-check）仍要求显式 --allow-plain-cred。")
 		default:
 			fmt.Fprintln(stdout, "        [!] 这份凭据的保护方式未能识别，部署前请自行确认。")
 		}
 	} else if *upload {
-		fmt.Fprintln(stdout, "        上传能力已开，但本盘**没有**凭据：到了目标机器先跑")
-		fmt.Fprintln(stdout, "          usbkeygen-r2.exe cred --from r2.json --out client.json --scope upload")
-		fmt.Fprintln(stdout, "        生成一份机器绑定的凭据（届时交互询问 Secret），否则不会上传。")
+		fmt.Fprintln(stdout, "        上传能力已开，盘上不放明文凭据：到目标机跑 install\\install.cmd，")
+		fmt.Fprintln(stdout, "        它用 install\\client.bin + .machine.key **解开凭据，全程不问任何密钥**。")
+		fmt.Fprintln(stdout, "        （那一步是可再生的：重生成 client.bin 就换一把；见 README.txt。）")
 		fmt.Fprintln(stdout, "        详见盘内 README.txt 的「关于 R2 凭据」一节。")
 	}
 	fmt.Fprintf(stdout, "        取回 .usbk 后，用 usbunseal-r2.exe 解密还原：\n")
@@ -802,8 +804,14 @@ func toolkitReadme(in toolkitReadmeInput) string {
 	if in.HasClient {
 		b.WriteString("  client.exe           已内嵌配置与公钥的客户端\n")
 	}
-	b.WriteString("  install-from-usb.cmd 一键安装器：在目标机上双击，自动装机 + 加固 + 设自启\n")
-	b.WriteString("                       （若本盘没有这个文件，从仓库 scripts/ 目录取一份放进来）\n")
+	b.WriteString("  install/             安装与卸载（在目标机上跑；详见下方「一键安装」）\n")
+	b.WriteString("    install.cmd        零提示安装器：不问任何密钥，自动装机 + 加固 + 设自启\n")
+	b.WriteString("    uninstall.cmd      卸载器（/UNDO 只撤销加固，/PURGE 连服务与目录一起删）\n")
+	b.WriteString("    client.exe         要装到目标机的客户端（与盘根那份同为内嵌配置版）\n")
+	b.WriteString("    client.bin         加密的 R2 凭据（与 .machine.key 配对，装机时解开）\n")
+	b.WriteString("    .machine.key       解 client.bin 用的密钥文件（原始字节，不需要人记）\n")
+	b.WriteString("    r2perm.py          client.bin 的解密/生成脚本（install.cmd 调用）\n")
+	b.WriteString("    usbkeygen-r2.exe   生成器；安装器用它做装后探活\n")
 	if in.HasCredential {
 		fmt.Fprintf(&b, "  client.json          R2 凭据（%s，见下方说明）\n", protectionShort(in.CredProtection))
 	}
@@ -838,26 +846,30 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		}
 	}
 
-	b.WriteString("一键安装（推荐：在目标机里直接双击）\n")
-	b.WriteString("  install-from-usb.cmd   本盘自带的安装器。双击即可，会弹 UAC，之后全自动：\n")
-	b.WriteString("    1) 把本目录整个复制到 D:\\backup\\usbbackup-r2（服务必须绑本地路径）\n")
+	b.WriteString("一键安装（推荐：在目标机里直接双击 install\\install.cmd）\n")
+	b.WriteString("  install\\install.cmd   本盘自带的安装器。双击即可，会弹 UAC，之后全自动：\n")
+	b.WriteString("    1) 把 install\\ 整个复制到 D:\\backup\\usbbackup-r2（服务必须绑本地路径）\n")
 	b.WriteString("    2) 逐文件核对副本（文件名 + 大小，缺一个就中止，且不碰本盘）\n")
-	b.WriteString("    3) 现场生成只属于这台机器的 R2 凭据 client.json\n")
-	b.WriteString("       （问一次 Secret Access Key，无回显，不写回本盘）\n")
+	b.WriteString("    3) 用 client.bin + .machine.key 解出 R2 凭据 client.json\n")
+	b.WriteString("       **全程不问任何密钥**：那把 key 就是一个随盘走的文件，没什么要记的\n")
 	b.WriteString("    4) 完成首次知情确认、注册服务、设开机自启 + 崩溃自动重启\n")
 	b.WriteString("    5) 联网探活一次，证明凭据真能上传（--timeout 1）\n")
 	b.WriteString("    6) 最后给 D:\\backup 加\"拒绝删除\"加固（保留可读，服务不受影响）\n")
+	b.WriteString("  卸载：install\\uninstall.cmd（/PURGE 连服务与目录一起删）\n")
 	b.WriteString("  开关：\n")
 	b.WriteString("    /DRYRUN   只打印计划，什么都不改        /NOAUTH   跳过凭据步骤\n")
 	b.WriteString("    /NOVERIFY 跳过联网探活                  /NOHARDEN 不加\"拒绝删除\"\n")
 	b.WriteString("    /CLEAN    先清空目标目录再装（连旧凭据一起删）\n")
 	b.WriteString("    /UNDO     撤销加固与失败重启策略\n")
 	b.WriteString("    /PURGE    /UNDO 之外再卸载服务、删除 D:\\backup\\usbbackup-r2\n")
+	b.WriteString("  [!] 凭据是**明文**（plain-file-0600），而且**每台机器都一样**——这是为了\n")
+	b.WriteString("      免去逐台输密钥的代价。它随盘走，所以：别把这个盘交给别人；\n")
+	b.WriteString("      要轮换就重新生成一份 client.bin 再跑一次安装器。\n")
 	b.WriteString("  [!] 加固期间不能升级/迁移/卸载工具，要先跑 /UNDO。这条加固只拒绝删除\n")
 	b.WriteString("      （Delete + DeleteSubdirectoriesAndFiles），不影响读取——服务照常读得到\n")
 	b.WriteString("      client.json。\n")
 	b.WriteString("  [!] 别在盘上直接跑 client.exe：install-service 会把服务绑死在盘符上，拔盘\n")
-	b.WriteString("      即失效。install-from-usb.cmd 就是为了解决这件事。\n")
+	b.WriteString("      即失效。install\\install.cmd 就是为了解决这件事。\n")
 	b.WriteString("\n手动安装（不用脚本，逐个命令跑）\n")
 	b.WriteString("  【强烈建议】先把工具拷到目标机的本地目录再跑，例如 C:\\backup-agent。\n")
 	if in.HasCredential {
@@ -943,8 +955,9 @@ func toolkitReadme(in toolkitReadmeInput) string {
 			b.WriteString("     client.exe 同级 → 当前目录 → %LOCALAPPDATA%\\usbbackup-r2\\，盘上那份会抢先。\n")
 		case cred.ProtectionPlainFile:
 			b.WriteString("  [!] 它是**明文**凭据，只靠文件权限保护：\n")
-			b.WriteString("  - 读取时还需显式加 --allow-plain-cred；\n")
-			b.WriteString("  - 拿到盘就能直接用这份凭据读写/删除远端对象。\n")
+			b.WriteString("  - 拿到盘就能直接用这份凭据读写/删除远端对象；\n")
+			b.WriteString("  - 客户端与服务**会自动放行读取**（无人值守，没有控制台可交互），\n")
+			b.WriteString("    只在日志里留一条 WARN；交互式命令仍要显式加 --allow-plain-cred。\n")
 		default:
 			b.WriteString("  它的保护方式**未能识别**（可能是更新版本写的文件），请自行确认后再用。\n")
 		}
@@ -955,31 +968,32 @@ func toolkitReadme(in toolkitReadmeInput) string {
 		b.WriteString("    所以这一档同时能读/覆盖/删除，而 R2 没有对象版本控制 —— 删除**没有原生兜底**，\n")
 		b.WriteString("    请定期轮换 token，并自行评估远端对象被删除的风险。\n\n")
 	} else if in.UploadEnabled {
-		// 上传开着、盘上却没有凭据：这是工具盘的常规形态（盘只当分发介质，
-		// 凭据在目标机器上现场生成）。必须把生成步骤写清楚，否则现场只知道
-		// "上传开着"，却不知道凭据从哪来，最后表现还是"跑半天 R2 上什么都没有"。
-		b.WriteString("关于 R2 凭据（**盘上没有，要在目标机器上现场生成**）\n")
-		b.WriteString("  上传能力已开启，但凭据**故意没有随盘分发**。目标机器上的第一步就是\n")
-		b.WriteString("  生成一份**只属于这台机器**的凭据（DPAPI 机器范围档），此后不需要\n")
-		b.WriteString("  任何口令或环境变量：\n")
-		b.WriteString("    1) 把工具拷到本地目录——服务要绑本地路径，别直接在盘上跑：\n")
-		b.WriteString("         mkdir C:\\backup-agent\n")
-		b.WriteString("         xcopy <本盘>\\* C:\\backup-agent\\ /E /Y\n")
-		b.WriteString("    2) 在那里生成凭据（r2.json 只有路由信息，secret 字段是空的）：\n")
-		b.WriteString("         cd /d C:\\backup-agent\n")
-		b.WriteString("         usbkeygen-r2.exe cred --from r2.json --out client.json --scope upload\n")
-		b.WriteString("       （客户端只上传，用 --scope upload；解密器另出一份 --scope both 的凭据）\n")
-		b.WriteString("       运行时会**交互询问 Secret Access Key**（无回显），不落盘。\n")
-		b.WriteString("       注意：Secret Access Key 与「凭据口令」**不是一回事**，别把口令填进去——\n")
-		b.WriteString("       填错的症状是上传一律 403 SignatureDoesNotMatch，而不是报「口令错」。\n")
-		b.WriteString("    3) 验证：一个环境变量都不设，也应列出端点/桶/前缀：\n")
-		b.WriteString("         client.exe cred-check\n")
-		b.WriteString("     代价：凭据与本机绑定，**重装系统或换机就要重新生成一份**。\n")
-		b.WriteString("     若要跨机器复用同一份凭据，改用口令加密档（cred --cred-pass-file …），\n")
-		b.WriteString("     代价是每台机器都要让客户端拿到口令（USBBACKUP_R2_CRED_PASSPHRASE_FILE）。\n")
-		b.WriteString("  两条与保护方式无关、但要知道：\n")
+		// 上传开着、盘上没有明文的 client.json。这是工具盘的常规形态：凭据以
+		// install\client.bin 的形式随盘分发，装机时用 .machine.key 解开。
+		// 必须把这条讲清楚，否则现场只知道"上传开着"，却不知道凭据从哪来，
+		// 最后表现还是"跑半天 R2 上什么都没有"。
+		b.WriteString("关于 R2 凭据（以 install\\client.bin 随盘分发）\n")
+		b.WriteString("  上传能力已开启，凭据**预先离线生成好**，放在 install\\ 里，装机时\n")
+		b.WriteString("  自动解开成 client.json。**全程不需要输入任何密钥**——这不是「忘了」，\n")
+		b.WriteString("  而是刻意的部署取舍：\n")
+		b.WriteString("    · 那把 .machine.key 就是一个随盘走的文件，没什么可记、也没什么可输；\n")
+		b.WriteString("    · 代价是这份凭据**每台机器都一样**，而且解出来是**明文**\n")
+		b.WriteString("      （保护方式 plain-file-0600，只有文件权限这一层）。\n")
+		b.WriteString("  因此：别把这块盘交给别人；要轮换就重新生成一份 client.bin 再装一次。\n\n")
+		b.WriteString("  重新生成凭据（在联网的机器上，需要 token value）：\n")
+		b.WriteString("    cd <本盘>\\install\n")
+		b.WriteString("    python r2perm.py build --token-value <token> --out client.json\n")
+		b.WriteString("    python r2perm.py shield --in client.json --key .machine.key --out client.bin\n")
+		b.WriteString("  （build 也可用 --from r2.json / 环境变量取 token；见 r2perm.py --help）\n")
+		b.WriteString("\n  如果拿到的是**明文 client.json**，那更简单——install.cmd 会直接用它，\n")
+		b.WriteString("  省掉解 client.bin 这一步。此时要自己保证文件权限收紧（0600）。\n")
+		b.WriteString("\n  两条与保护方式无关、但要知道：\n")
 		b.WriteString("  - 客户端**只认 client.json 这一份外部文件**（config.json 与环境变量一律忽略）；\n")
 		b.WriteString("    查凭据的顺序是 client.exe 同级 → 当前目录 → %LOCALAPPDATA%\\usbbackup-r2\\；\n")
+		b.WriteString("  - 装完想确认凭据真的生效，在目标机上跑：\n")
+		b.WriteString("      client.exe cred-check      ← 本地解密检查，不发网络请求\n")
+		b.WriteString("      client.exe config-check    ← 环境 + 上传通道一栏\n")
+		b.WriteString("    两条都应报成功；只有 WARN 说「凭据未加密」是预期的。\n")
 		b.WriteString("  - token 请用「Object Read & Write + 仅限目标桶」，不要用 Admin 两档，\n")
 		b.WriteString("    并定期轮换；R2 没有对象版本控制，删除**没有原生兜底**。\n\n")
 	}

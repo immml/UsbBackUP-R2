@@ -793,8 +793,11 @@ func TestToolkitReadmeStatesUploadOff(t *testing.T) {
 	}
 }
 
-// 上传开着、盘上却没凭据（工具盘的常规形态）：必须写清凭据从哪来，
-// 否则现场只知道"上传开着"却不知道还得先生成凭据，结果一样是没上传。
+// 上传开着、盘上没有明文 client.json（工具盘的常规形态）：必须写清凭据从哪来。
+//
+// 现在的形态是凭据以 install\client.bin 随盘分发、装机时用 .machine.key 解开，
+// 所以断言落在"bin + key 这套离线流程"上，而不是原来的"现场 cred 交互输入"。
+// 否则现场只知道"上传开着"却不知道凭据从哪来，结果一样是没上传。
 func TestToolkitReadmeGivesCredentialStepsWhenUploadWithoutCredential(t *testing.T) {
 	got := toolkitReadme(toolkitReadmeInput{
 		Fingerprint: "aa bb", HasClient: true, UploadEnabled: true,
@@ -802,11 +805,13 @@ func TestToolkitReadmeGivesCredentialStepsWhenUploadWithoutCredential(t *testing
 		GateThreshold: "10GiB", GateMaxTotal: "10GiB", GateCollect: "all",
 	})
 	for _, must := range []string{
-		"会自动上传到 R2", // 上传确实开着，这句是实话
-		"r2.json",   // 素材要在盘里
-		"cred --from r2.json",
-		"cred-check",
-		"Secret Access Key",
+		"会自动上传到 R2",       // 上传确实开着，这句是实话
+		"r2.json",         // 素材要在盘里（r2perm.py build 会用到）
+		"client.bin",      // 随盘分发的加密凭据
+		".machine.key",    // 解开它用的密钥文件
+		"r2perm.py build", // 重新生成凭据的办法
+		"cred-check",      // 验证办法（手动路径仍会用）
+		"明文",              // 必须如实说明解出来是明文的
 	} {
 		if !strings.Contains(got, must) {
 			t.Errorf("上传开启但盘上无凭据时，README 未提到 %q", must)
